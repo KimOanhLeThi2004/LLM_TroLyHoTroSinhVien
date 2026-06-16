@@ -87,6 +87,8 @@ from documents.templating.filepath import validate_filepath_template_and_render
 from documents.templating.utils import convert_format_str_to_template_format
 from documents.validators import uri_validator
 from documents.validators import url_validator
+from paperless_ai.ai_status import get_ai_extract_status
+from paperless_ai.ai_status import is_ai_extract_processing
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -1001,6 +1003,7 @@ class DocumentSerializer(
     created_date = serializers.DateField(required=False)
     page_count = SerializerMethodField()
     duplicate_documents = SerializerMethodField()
+    ai_extract_status = SerializerMethodField()
 
     notes = NotesSerializer(many=True, required=False, read_only=True)
     root_document: RelatedField[Document, Document, Any] | ManyRelatedField = (
@@ -1029,6 +1032,9 @@ class DocumentSerializer(
 
     def get_page_count(self, obj) -> int | None:
         return obj.page_count
+
+    def get_ai_extract_status(self, obj):
+        return get_ai_extract_status(obj.id)
 
     @extend_schema_field(DuplicateDocumentSummarySerializer(many=True))
     def get_duplicate_documents(self, obj):
@@ -1093,6 +1099,8 @@ class DocumentSerializer(
             doc["content"] = getattr(instance, "effective_content") or ""
         if self.truncate_content and "content" in self.fields:
             doc["content"] = doc.get("content")[0:550]
+        if "content" in doc and is_ai_extract_processing(instance.id):
+            doc["content"] = ""
         return doc
 
     def to_internal_value(self, data):
@@ -1242,6 +1250,7 @@ class DocumentSerializer(
             "original_file_name",
             "archived_file_name",
             "duplicate_documents",
+            "ai_extract_status",
             "owner",
             "permissions",
             "user_can_change",

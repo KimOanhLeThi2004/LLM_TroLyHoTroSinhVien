@@ -59,6 +59,7 @@ from paperless.parsers.registry import get_parser_registry
 from paperless.parsers.utils import PDF_TEXT_MIN_LENGTH
 from paperless.parsers.utils import extract_pdf_text
 from paperless.parsers.utils import is_tagged_pdf
+from paperless_ai.document_classifier import classify_document_input
 
 LOGGING_NAME: Final[str] = "paperless.consumer"
 
@@ -418,6 +419,7 @@ class ConsumerPlugin(
 
             self.log.debug(f"Detected mime type: {mime_type}")
 
+
             if (
                 Path(self.filename).suffix.lower() == ".pdf"
                 and mime_type in settings.CONSUMER_PDF_RECOVERABLE_MIME_TYPES
@@ -463,6 +465,23 @@ class ConsumerPlugin(
                     ConsumerStatusShortMessage.UNSUPPORTED_TYPE,
                     f"Unsupported mime type {mime_type}",
                 )
+
+            parser_name = getattr(parser_class, "name", parser_class.__name__)
+            ai_classification = classify_document_input(
+                file_path=self.working_copy,
+                file_name=self.filename,
+                mime_type=mime_type,
+                parser_name=parser_name,
+            )
+            self.log.info(
+                "AI classification using Paperless MIME/parser: type=%s mode=%s confidence=%s reason=%s mime_type=%s parser=%s",
+                ai_classification.detected_type,
+                ai_classification.extract_mode,
+                ai_classification.confidence,
+                ai_classification.reason,
+                mime_type,
+                parser_name,
+            )
 
             # Notify all listeners that we're going to do some work.
 
@@ -653,6 +672,7 @@ class ConsumerPlugin(
                             original_file=self.unmodified_original
                             if self.unmodified_original
                             else self.working_copy,
+                            ai_classification=ai_classification.as_dict(),
                         )
 
                         # After everything is in the database, copy the files into

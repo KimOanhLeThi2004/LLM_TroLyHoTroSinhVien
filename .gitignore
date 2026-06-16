@@ -115,3 +115,7 @@ celerybeat-schedule*
 
 # Git worktree local folder
 .worktrees
+docker/compose/docker-compose.env
+docker/compose/docker-compose.postgres-tika.yml
+paperless.conf.demo1
+scripts/run-dev-full.sh

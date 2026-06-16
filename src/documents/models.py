@@ -158,6 +158,13 @@ class StoragePath(MatchingModel):
 class Document(SoftDeleteModel, ModelWithOwner):  # type: ignore[django-manager-missing]
     MAX_STORED_FILENAME_LENGTH: Final[int] = 1024
 
+    class AiExtractStatus(models.TextChoices):
+        QUEUED = "queued", _("Queued")
+        PROCESSING = "processing", _("Processing")
+        GEMINI_PROCESSING = "gemini_processing", _("Gemini processing")
+        COMPLETED = "completed", _("Completed")
+        FAILED = "failed", _("Failed")
+
     correspondent = models.ForeignKey(
         Correspondent,
         blank=True,
@@ -203,6 +210,42 @@ class Document(SoftDeleteModel, ModelWithOwner):  # type: ignore[django-manager-
         null=False,
         serialize=False,
         help_text="Length of the content field in characters. Automatically maintained by the database for faster statistics computation.",
+    )
+
+    ai_extract_status = models.CharField(
+        _("AI extract status"),
+        max_length=32,
+        choices=AiExtractStatus.choices,
+        default=AiExtractStatus.COMPLETED,
+        db_index=True,
+        help_text=_("Current AI extraction lifecycle status for this document."),
+    )
+
+    ai_extract_reason = models.TextField(
+        _("AI extract reason"),
+        blank=True,
+        help_text=_("Human-readable reason for the current AI extraction status."),
+    )
+
+    ai_extract_mode = models.CharField(
+        _("AI extract mode"),
+        max_length=64,
+        blank=True,
+        help_text=_("Extraction mode selected for this document."),
+    )
+
+    ai_extract_score = models.FloatField(
+        _("AI extract score"),
+        blank=True,
+        null=True,
+        help_text=_("Latest OCR quality score used by the AI extraction pipeline."),
+    )
+
+    ai_extract_error = models.JSONField(
+        _("AI extract error"),
+        blank=True,
+        null=True,
+        help_text=_("Latest AI extraction error payload, if extraction failed."),
     )
 
     mime_type = models.CharField(_("mime type"), max_length=256, editable=False)
