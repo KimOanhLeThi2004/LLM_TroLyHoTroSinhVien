@@ -10,6 +10,8 @@ from paperless.config import AIConfig
 from paperless.network import validate_outbound_http_url
 from paperless_ai.base_model import DocumentClassifierSchema
 
+GEMINI_BACKEND = "gemini"
+
 logger = logging.getLogger("paperless_ai.client")
 
 
@@ -22,7 +24,7 @@ class AIClient:
         self.settings = AIConfig()
         self.llm = self.get_llm()
 
-    def get_llm(self) -> "Ollama | OpenAI":
+    def get_llm(self) -> "Ollama | OpenAI | object":
         if self.settings.llm_backend == "ollama":
             from llama_index.llms.ollama import Ollama
 
@@ -48,6 +50,13 @@ class AIClient:
             return OpenAI(
                 model=self.settings.llm_model or "gpt-3.5-turbo",
                 api_base=endpoint,
+                api_key=self.settings.llm_api_key,
+            )
+        elif self.settings.llm_backend == GEMINI_BACKEND:
+            from llama_index.llms.gemini import Gemini
+
+            return Gemini(
+                model=self.settings.llm_model or "gemini-2.5-flash",
                 api_key=self.settings.llm_api_key,
             )
         else:

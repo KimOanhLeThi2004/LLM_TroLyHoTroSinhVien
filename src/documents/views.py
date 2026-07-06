@@ -228,6 +228,8 @@ from paperless.config import AIConfig
 from paperless.config import GeneralConfig
 from paperless.models import ApplicationConfiguration
 from paperless.parsers.registry import get_parser_registry
+from paperless_ai.ai_status import STATUS_COMPLETED
+from paperless_ai.ai_status import get_ai_extract_status
 from paperless.serialisers import GroupSerializer
 from paperless.serialisers import UserSerializer
 from paperless.views import StandardPagination
@@ -995,7 +997,7 @@ class DocumentViewSet(
 
         root_doc = self.get_object()
         content_doc = self._resolve_file_doc(root_doc, request)
-        response.data["content"] = content_doc.content or ""
+        response.data["content"] = self._get_visible_content(content_doc)
         return response
 
     def update(self, request, *args, **kwargs):
@@ -1034,7 +1036,7 @@ class DocumentViewSet(
         refreshed_doc = self.get_queryset().get(pk=root_doc.pk)
         response_data = self.get_serializer(refreshed_doc).data
         if "version" in request.query_params and "content" in response_data:
-            response_data["content"] = content_doc.content
+            response_data["content"] = self._get_visible_content(content_doc)
         response = Response(response_data)
 
         from documents.search import get_backend
@@ -1047,6 +1049,12 @@ class DocumentViewSet(
         )
 
         return response
+
+    def _get_visible_content(self, document: Document) -> str:
+        ai_status = get_ai_extract_status(document.id)
+        if ai_status.get("status") != STATUS_COMPLETED:
+            return ""
+        return document.content or ""
 
     def list(self, request, *args, **kwargs):
         if not get_boolean(

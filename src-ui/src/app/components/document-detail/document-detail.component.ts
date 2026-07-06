@@ -562,6 +562,25 @@ export class DocumentDetailComponent
             openDocument.duplicate_documents = doc.duplicate_documents
             this.openDocumentService.save()
           }
+          if (
+            openDocument &&
+            doc.ai_extract_status?.status &&
+            doc.ai_extract_status.status !== 'completed'
+          ) {
+            openDocument.content = ''
+            openDocument.ai_extract_status = doc.ai_extract_status
+            this.openDocumentService.save()
+          }
+          if (
+            openDocument &&
+            doc.ai_extract_status?.status &&
+            doc.ai_extract_status.status !== openDocument.ai_extract_status?.status
+          ) {
+            Object.assign(openDocument, doc)
+            openDocument.__changedFields = []
+            this.openDocumentService.setDirty(openDocument, false)
+            this.openDocumentService.save()
+          }
           let useDoc = openDocument || doc
           if (openDocument && forceRemote) {
             Object.assign(openDocument, doc)

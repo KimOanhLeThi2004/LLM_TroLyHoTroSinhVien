@@ -4,6 +4,7 @@ import sys
 from documents.models import Document
 from paperless_ai.client import AIClient
 from paperless_ai.indexing import load_or_build_index
+from paperless_ai.qdrant_retriever import retrieve_context_from_qdrant
 
 logger = logging.getLogger("paperless_ai.chat")
 
@@ -21,6 +22,19 @@ CHAT_PROMPT_TMPL = """Context information is below.
 
 def stream_chat_with_documents(query_str: str, documents: list[Document]):
     client = AIClient()
+
+    qdrant_context = retrieve_context_from_qdrant(query_str)
+    if qdrant_context:
+        context = "\n\n".join(qdrant_context)
+        prompt = CHAT_PROMPT_TMPL.replace("{context_str}", context).replace("{query_str}", query_str)
+        response = client.llm.chat([client.llm.create_chat_message(role="user", content=prompt)])
+        for chunk in response:
+            if hasattr(chunk, "text"):
+                yield chunk.text
+            else:
+                yield str(chunk)
+        return
+
     index = load_or_build_index()
 
     doc_ids = [str(doc.pk) for doc in documents]

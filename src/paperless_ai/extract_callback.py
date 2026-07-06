@@ -3,8 +3,11 @@ import os
 
 from celery import shared_task
 from django.db import transaction
+from rest_framework import serializers
 
+from documents.data_models import DocumentMetadataOverrides
 from documents.models import Document
+from documents.plugins.helpers import DocumentsStatusManager
 from paperless_ai.ai_status import STATUS_COMPLETED
 from paperless_ai.ai_status import STATUS_FAILED
 from paperless_ai.ai_status import STATUS_GEMINI_PROCESSING
@@ -20,6 +23,10 @@ from paperless_ai.ocr_quality_check import check_ocr_quality
 logger = logging.getLogger("paperless_ai.extract_callback")
 
 WRITE_GEMINI_CONTENT_ENV = "PAPERLESS_AI_WRITE_GEMINI_CONTENT"
+
+
+class GeminiFallbackRequiredButFailed(RuntimeError):
+    pass
 
 
 def handle_document_consumed(
@@ -47,11 +54,20 @@ def handle_document_consumed(
         extra={"group": logging_group},
     )
 
+    queued_reason = "Paperless consumed document; AI extraction is queued."
+    queued_extract_mode = classification.get("extract_mode") or ""
+
+    document.ai_extract_status = STATUS_QUEUED
+    document.ai_extract_reason = queued_reason
+    document.ai_extract_mode = queued_extract_mode
+    document.ai_extract_score = None
+    document.ai_extract_error = None
+
     set_ai_extract_status(
         document.id,
         STATUS_QUEUED,
-        reason="Paperless consumed document; AI extraction is queued.",
-        extract_mode=classification.get("extract_mode") or "",
+        reason=queued_reason,
+        extract_mode=queued_extract_mode,
     )
 
     transaction.on_commit(
@@ -66,8 +82,24 @@ def handle_document_consumed(
 def process_ai_extract_result(
     document_id: int,
     classification: dict | None = None,
+    *,
+    require_gemini_success: bool = False,
 ) -> None:
     """Normalize Paperless/Gemini extraction result and callback Tvdt.DigitalApi."""
+    run_ai_extract_result(
+        document_id,
+        classification,
+        require_gemini_success=require_gemini_success,
+    )
+
+
+def run_ai_extract_result(
+    document_id: int,
+    classification: dict | None = None,
+    *,
+    require_gemini_success: bool = False,
+) -> None:
+    """Run OCR quality scoring and Gemini fallback before exposing final content."""
     document = Document.objects.get(id=document_id)
     classification = classification or {}
     detected_type = classification.get("detected_type") or "unknown"
@@ -154,6 +186,9 @@ def process_ai_extract_result(
                 error=error_info,
             )
             confidence = min(confidence, 0.2)
+            if require_gemini_success:
+                raise GeminiFallbackRequiredButFailed(str(exc)) from exc
+            _notify_document_updated(document.id)
         except Exception as exc:
             logger.exception(
                 "Gemini Flash extraction failed document_id=%s",
@@ -173,6 +208,9 @@ def process_ai_extract_result(
                 error=error_info,
             )
             confidence = min(confidence, 0.2)
+            if require_gemini_success:
+                raise GeminiFallbackRequiredButFailed(str(exc)) from exc
+            _notify_document_updated(document.id)
     else:
         processing_log.append("Using Paperless native extracted content")
 
@@ -202,6 +240,7 @@ def process_ai_extract_result(
             extract_mode=extract_mode,
             score=quality.score,
         )
+        _notify_document_updated(document.id)
 
     logger.info(
         "AI TASK: extract schema ready id=%s detected_type=%s extract_mode=%s raw_text_length=%s",
@@ -211,7 +250,13 @@ def process_ai_extract_result(
         len(raw_text),
     )
 
-    callback_extract_result(payload)
+    try:
+        callback_extract_result(payload)
+    except Exception:
+        logger.exception(
+            "DigitalApi extract callback failed document_id=%s",
+            document.id,
+        )
 
 
 def _save_gemini_content_to_document(
@@ -235,6 +280,7 @@ def _save_gemini_content_to_document(
 
     document.content = normalized_text
     document.save(update_fields=["content"])
+    _update_search_index(document)
     processing_log.append("Gemini raw_text saved to Paperless document.content")
 
 
@@ -242,3 +288,33 @@ def _should_write_gemini_content() -> bool:
     value = os.getenv(WRITE_GEMINI_CONTENT_ENV, "true").strip().lower()
     return value not in {"0", "false", "no", "off"}
 
+
+def _update_search_index(document: Document) -> None:
+    try:
+        from documents.search import get_backend
+
+        document.refresh_from_db()
+        get_backend().add_or_update(
+            document,
+            effective_content=document.get_effective_content(),
+        )
+    except Exception:
+        logger.exception(
+            "Failed to update search index after Gemini content update document_id=%s",
+            document.id,
+        )
+
+
+def _notify_document_updated(document_id: int) -> None:
+    document = Document.objects.get(id=document_id)
+    doc_overrides = DocumentMetadataOverrides.from_document(document)
+    modified = serializers.DateTimeField().to_representation(document.modified)
+
+    with DocumentsStatusManager() as status_mgr:
+        status_mgr.send_document_updated(
+            document_id=document.id,
+            modified=modified,
+            owner_id=doc_overrides.owner_id,
+            users_can_view=doc_overrides.view_users,
+            groups_can_view=doc_overrides.view_groups,
+        )

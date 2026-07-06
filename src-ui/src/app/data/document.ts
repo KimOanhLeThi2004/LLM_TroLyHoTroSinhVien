@@ -112,6 +112,15 @@ export interface SearchHit {
   note_highlights?: string
 }
 
+export interface AiExtractStatus {
+  status?: string
+  reason?: string
+  extract_mode?: string
+  score?: number
+  error?: any
+  is_processing?: boolean
+}
+
 export interface Document extends ObjectWithPermissions {
   correspondent?: number
 
@@ -158,6 +167,8 @@ export interface Document extends ObjectWithPermissions {
   remove_inbox_tags?: boolean
 
   page_count?: number
+
+  ai_extract_status?: AiExtractStatus
 
   duplicate_documents?: Document[]
 

@@ -6,6 +6,7 @@ from llama_index.core import VectorStoreIndex
 from llama_index.core.schema import TextNode
 
 from paperless_ai.chat import stream_chat_with_documents
+from paperless_ai.qdrant_retriever import retrieve_context_from_qdrant
 
 
 @pytest.fixture(autouse=True)
@@ -138,3 +139,50 @@ def test_stream_chat_no_matching_nodes() -> None:
         output = list(stream_chat_with_documents("Any info?", [MagicMock(pk=1)]))
 
         assert output == ["Sorry, I couldn't find any content to answer your question."]
+
+
+def test_retrieve_context_from_qdrant_returns_payload_text(monkeypatch) -> None:
+    monkeypatch.setenv("PAPERLESS_AI_QDRANT_URL", "https://example.test")
+    monkeypatch.setenv("PAPERLESS_AI_QDRANT_API_KEY", "secret")
+    monkeypatch.setenv("PAPERLESS_AI_QDRANT_COLLECTION", "docs")
+
+    class MockResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "result": [
+                    {
+                        "payload": {
+                            "text": "Relevant chunk",
+                            "title": "Doc 1",
+                        }
+                    }
+                ]
+            }
+
+    with patch("paperless_ai.qdrant_retriever.httpx.post", return_value=MockResponse()):
+        chunks = retrieve_context_from_qdrant("What is this?")
+
+    assert chunks == ["Relevant chunk"]
+
+
+def test_stream_chat_uses_qdrant_retrieval_when_configured(monkeypatch) -> None:
+    monkeypatch.setenv("PAPERLESS_AI_QDRANT_URL", "https://example.test")
+    monkeypatch.setenv("PAPERLESS_AI_QDRANT_API_KEY", "secret")
+    monkeypatch.setenv("PAPERLESS_AI_QDRANT_COLLECTION", "docs")
+
+    with (
+        patch("paperless_ai.chat.AIClient") as mock_client_cls,
+        patch("paperless_ai.chat.retrieve_context_from_qdrant") as mock_retrieve_context,
+    ):
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+        mock_client.stream_chat.return_value = iter(["hello"])
+
+        mock_retrieve_context.return_value = ["Relevant chunk"]
+
+        output = list(stream_chat_with_documents("What is this?", [MagicMock(pk=1)]))
+
+    assert output == ["hello"]
