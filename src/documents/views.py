@@ -3024,6 +3024,53 @@ class SearchAutoCompleteView(GenericAPIView[Any]):
 
 @extend_schema_view(
     get=extend_schema(
+        description="Preprocess a query for hybrid search",
+        parameters=[
+            OpenApiParameter(
+                name="query",
+                required=True,
+                type=str,
+                description="Query to preprocess",
+            ),
+        ],
+        responses={
+            (200, "application/json"): inline_serializer(
+                name="PreprocessedSearchQuery",
+                fields={
+                    "original_query": serializers.CharField(),
+                    "normalized_query": serializers.CharField(),
+                    "tokens": serializers.ListField(child=serializers.CharField()),
+                    "phrase_groups": serializers.ListField(
+                        child=serializers.CharField(),
+                    ),
+                },
+            ),
+        },
+    ),
+)
+class SearchPreprocessView(GenericAPIView[Any]):
+    permission_classes = (IsAuthenticated,)
+
+    def get(self, request, format=None):
+        query = request.query_params.get("query", None)
+        if query is None:
+            return HttpResponseBadRequest("Query required")
+
+        from documents.search import preprocess_hybrid_query
+
+        preprocessed = preprocess_hybrid_query(query)
+        return Response(
+            {
+                "original_query": preprocessed.original_query,
+                "normalized_query": preprocessed.normalized_query,
+                "tokens": preprocessed.tokens,
+                "phrase_groups": preprocessed.phrase_groups,
+            },
+        )
+
+
+@extend_schema_view(
+    get=extend_schema(
         description="Global search",
         parameters=[
             OpenApiParameter(

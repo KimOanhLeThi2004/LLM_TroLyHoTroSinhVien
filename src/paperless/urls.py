@@ -35,6 +35,7 @@ from documents.views import ReprocessDocumentsView
 from documents.views import RotateDocumentsView
 from documents.views import SavedViewViewSet
 from documents.views import SearchAutoCompleteView
+from documents.views import SearchPreprocessView
 from documents.views import SelectionDataView
 from documents.views import SharedLinkView
 from documents.views import ShareLinkBundleViewSet
@@ -115,6 +116,11 @@ urlpatterns = [
                                 "^autocomplete/",
                                 SearchAutoCompleteView.as_view(),
                                 name="autocomplete",
+                            ),
+                            re_path(
+                                "^preprocess/",
+                                SearchPreprocessView.as_view(),
+                                name="search_preprocess",
                             ),
                         ],
                     ),
