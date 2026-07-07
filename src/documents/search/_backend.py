@@ -19,11 +19,14 @@ from django.conf import settings
 from django.utils.timezone import get_current_timezone
 from guardian.shortcuts import get_users_with_perms
 
+from documents.search._hybrid_fulltext import HybridFullTextResult
+from documents.search._hybrid_fulltext import score_hybrid_fulltext_document
 from documents.search._normalize import ascii_fold
 from documents.search._query import build_permission_filter
 from documents.search._query import parse_simple_text_query
 from documents.search._query import parse_simple_title_query
 from documents.search._query import parse_user_query
+from documents.search._query_preprocessor import preprocess_hybrid_query
 from documents.search._schema import _write_sentinels
 from documents.search._schema import build_schema
 from documents.search._schema import open_or_rebuild_index
@@ -645,6 +648,126 @@ class TantivyBackend:
 
         return matches[:limit]
 
+    # def hybrid_fulltext_search(
+    #     self,
+    #     query: str,
+    #     user: AbstractBaseUser | None,
+    #     *,
+    #     limit: int = 20,
+    # ) -> list[HybridFullTextResult]:
+    #     """
+    #     Execute the first-stage hybrid full-text search.
+
+    #     This intentionally returns raw scoring details for re-ranking instead
+    #     of serialized documents. It is used to validate the full-text scoring
+    #     strategy before semantic search and final result merging are added.
+    #     """
+    #     self._ensure_open()
+    #     preprocessed_query = preprocess_hybrid_query(query)
+    #     if not preprocessed_query.normalized_query:
+    #         return []
+
+    #     searcher = self._index.searcher()
+    #     if user is not None and not user.is_superuser:
+    #         base_query = build_permission_filter(self._schema, user)
+    #     else:
+    #         base_query = tantivy.Query.all_query()
+
+    #     search_results = searcher.search(base_query, limit=10000)
+    #     scored_results: list[HybridFullTextResult] = []
+
+    #     for _score, doc_address in search_results.hits:
+    #         stored_doc = searcher.doc(doc_address).to_dict()
+    #         document_id = stored_doc["id"][0]
+    #         document_code_parts = [str(document_id)]
+    #         if "checksum" in stored_doc:
+    #             document_code_parts.extend(stored_doc["checksum"])
+    #         if "asn" in stored_doc:
+    #             document_code_parts.extend(str(asn) for asn in stored_doc["asn"])
+
+    #         scored_result = score_hybrid_fulltext_document(
+    #             document_id=document_id,
+    #             fields={
+    #                 "document_code": " ".join(document_code_parts),
+    #                 "title": stored_doc.get("title", []),
+    #                 "content": stored_doc.get("content", []),
+    #             },
+    #             preprocessed_query=preprocessed_query,
+    #         )
+    #         if scored_result is not None:
+    #             scored_results.append(scored_result)
+
+    #     return sorted(
+    #         scored_results,
+    #         key=lambda result: (-result.score, result.document_id),
+    #     )[:limit]
+def hybrid_fulltext_search(
+    self,
+    query: str,
+    user: AbstractBaseUser | None,
+    *,
+    limit: int | None = None,
+) -> list[HybridFullTextResult]:
+    """
+    Execute the first-stage hybrid full-text search.
+
+    This intentionally returns raw scoring details for re-ranking instead
+    of serialized documents. It is used to validate the full-text scoring
+    strategy before semantic search and final result merging are added.
+    """
+    self._ensure_open()
+
+    preprocessed_query = preprocess_hybrid_query(query)
+    if not preprocessed_query.normalized_query:
+        return []
+
+    searcher = self._index.searcher()
+
+    if user is not None and not user.is_superuser:
+        base_query = build_permission_filter(self._schema, user)
+    else:
+        base_query = tantivy.Query.all_query()
+
+    search_results = searcher.search(base_query, limit=10000)
+
+    scored_results: list[HybridFullTextResult] = []
+
+    for _score, doc_address in search_results.hits:
+        stored_doc = searcher.doc(doc_address).to_dict()
+
+        document_id = stored_doc["id"][0]
+
+        document_code_parts = [str(document_id)]
+
+        if "checksum" in stored_doc:
+            document_code_parts.extend(stored_doc["checksum"])
+
+        if "asn" in stored_doc:
+            document_code_parts.extend(str(asn) for asn in stored_doc["asn"])
+
+        scored_result = score_hybrid_fulltext_document(
+            document_id=document_id,
+            fields={
+                "document_code": " ".join(document_code_parts),
+                "title": stored_doc.get("title", []),
+                "content": stored_doc.get("content", []),
+            },
+            preprocessed_query=preprocessed_query,
+        )
+
+        if scored_result is not None:
+            scored_results.append(scored_result)
+
+    results = sorted(
+        scored_results,
+        key=lambda result: (-result.score, result.document_id),
+    )
+
+    if limit is not None:
+        return results[:limit]
+
+    return results
+    
     def more_like_this(
         self,
         doc_id: int,

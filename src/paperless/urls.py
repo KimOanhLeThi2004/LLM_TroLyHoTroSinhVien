@@ -35,6 +35,7 @@ from documents.views import ReprocessDocumentsView
 from documents.views import RotateDocumentsView
 from documents.views import SavedViewViewSet
 from documents.views import SearchAutoCompleteView
+from documents.views import SearchFullTextView
 from documents.views import SearchPreprocessView
 from documents.views import SelectionDataView
 from documents.views import SharedLinkView
@@ -121,6 +122,11 @@ urlpatterns = [
                                 "^preprocess/",
                                 SearchPreprocessView.as_view(),
                                 name="search_preprocess",
+                            ),
+                            re_path(
+                                "^fulltext/",
+                                SearchFullTextView.as_view(),
+                                name="search_fulltext",
                             ),
                         ],
                     ),

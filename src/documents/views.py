@@ -3071,6 +3071,80 @@ class SearchPreprocessView(GenericAPIView[Any]):
 
 @extend_schema_view(
     get=extend_schema(
+        description="Run first-stage hybrid full-text search",
+        parameters=[
+            OpenApiParameter(
+                name="query",
+                required=True,
+                type=str,
+                description="Query to search for",
+            ),
+            OpenApiParameter(
+                name="limit",
+                required=False,
+                type=int,
+                description="Number of results to return",
+            ),
+        ],
+        responses={
+            (200, "application/json"): inline_serializer(
+                name="HybridFullTextSearchResults",
+                fields={
+                    "query": serializers.CharField(),
+                    "total": serializers.IntegerField(),
+                    "results": serializers.ListField(
+                        child=serializers.DictField(),
+                    ),
+                },
+            ),
+        },
+    ),
+)
+class SearchFullTextView(GenericAPIView[Any]):
+    permission_classes = (IsAuthenticated,)
+
+    def get(self, request, format=None):
+        query = request.query_params.get("query", None)
+        if query is None:
+            return HttpResponseBadRequest("Query required")
+
+        if "limit" in request.query_params:
+            limit = int(request.query_params["limit"])
+            if limit <= 0:
+                return HttpResponseBadRequest("Invalid limit")
+        else:
+            limit = 20
+
+        from documents.search import get_backend
+
+        user = None if request.user.is_superuser else request.user
+        results = get_backend().hybrid_fulltext_search(query, user=user, limit=limit)
+        return Response(
+            {
+                "query": query,
+                "total": len(results),
+                "results": [
+                    {
+                        "document_id": result.document_id,
+                        "score": result.score,
+                        "matches": [
+                            {
+                                "field": match.field,
+                                "match_type": match.match_type,
+                                "matched_text": match.matched_text,
+                                "score": match.score,
+                            }
+                            for match in result.matches
+                        ],
+                    }
+                    for result in results
+                ],
+            },
+        )
+
+
+@extend_schema_view(
+    get=extend_schema(
         description="Global search",
         parameters=[
             OpenApiParameter(
