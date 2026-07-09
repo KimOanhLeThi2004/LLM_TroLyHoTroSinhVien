@@ -104,7 +104,14 @@ def semantic_search(
     )
 
     node_results = retriever.retrieve(_build_semantic_query_text(prepared_query))
-    aggregated_hits = _aggregate_node_results(node_results, min_score=min_score)
+    aggregated_hits = _normalize_document_scores(
+        _aggregate_node_results(node_results),
+    )
+    if min_score is not None:
+        aggregated_hits = [
+            hit for hit in aggregated_hits if hit.score >= min_score
+        ]
+
     permitted_ids = _permitted_document_ids(
         [hit.document_id for hit in aggregated_hits],
         user=user,
@@ -201,8 +208,6 @@ def _candidate_node_ids(index, document_ids: list[int] | None) -> list[str] | No
 
 def _aggregate_node_results(
     node_results: list[NodeWithScore],
-    *,
-    min_score: float | None,
 ) -> list[_AggregatedHit]:
     by_document: dict[int, _AggregatedHit] = {}
 
@@ -213,8 +218,6 @@ def _aggregate_node_results(
             continue
 
         score = _normalize_l2_score(node_result.score)
-        if min_score is not None and score < min_score:
-            continue
 
         existing = by_document.get(document_id)
         title = str(metadata.get("title") or "")
@@ -239,6 +242,35 @@ def _aggregate_node_results(
 
     return sorted(
         by_document.values(),
+        key=lambda hit: (hit.score, hit.matched_nodes),
+        reverse=True,
+    )
+
+
+def _normalize_document_scores(hits: list[_AggregatedHit]) -> list[_AggregatedHit]:
+    """
+    Normalize final document scores so they match Tantivy search score semantics.
+
+    Full-text search returns scores in the 0..1 range with the top hit at 1.0.
+    Semantic scores are first computed from FAISS distance and multi-node boosts,
+    then normalized the same way so hybrid merging can compare both channels.
+    """
+    max_score = max((hit.score for hit in hits), default=0.0)
+    if max_score <= 0.0:
+        return hits
+
+    normalized_hits = [
+        _AggregatedHit(
+            document_id=hit.document_id,
+            score=hit.score / max_score,
+            matched_nodes=hit.matched_nodes,
+            title=hit.title,
+            metadata=hit.metadata,
+        )
+        for hit in hits
+    ]
+    return sorted(
+        normalized_hits,
         key=lambda hit: (hit.score, hit.matched_nodes),
         reverse=True,
     )
