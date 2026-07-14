@@ -1381,6 +1381,7 @@ describe('DocumentDetailComponent', () => {
 
   it('should get suggestions', () => {
     const suggestionsSpy = jest.spyOn(documentService, 'getSuggestions')
+    const aiSuggestionsSpy = jest.spyOn(documentService, 'getAiSuggestions')
     suggestionsSpy.mockReturnValue(
       of({
         tags: [42, 43],
@@ -1391,6 +1392,35 @@ describe('DocumentDetailComponent', () => {
     )
     initNormally()
     expect(suggestionsSpy).toHaveBeenCalled()
+    expect(aiSuggestionsSpy).not.toHaveBeenCalled()
+    expect(component.suggestions).toEqual({
+      tags: [42, 43],
+      suggested_tags: [],
+      suggested_document_types: [],
+      suggested_correspondents: [],
+    })
+  })
+
+  it('should get AI suggestions when AI is enabled', () => {
+    const getSetting = settingsService.get.bind(settingsService)
+    jest
+      .spyOn(settingsService, 'get')
+      .mockImplementation((key) =>
+        key === SETTINGS_KEYS.AI_ENABLED ? true : getSetting(key)
+      )
+    const suggestionsSpy = jest.spyOn(documentService, 'getSuggestions')
+    const aiSuggestionsSpy = jest.spyOn(documentService, 'getAiSuggestions')
+    aiSuggestionsSpy.mockReturnValue(
+      of({
+        tags: [42, 43],
+        suggested_tags: [],
+        suggested_document_types: [],
+        suggested_correspondents: [],
+      })
+    )
+    initNormally()
+    expect(suggestionsSpy).not.toHaveBeenCalled()
+    expect(aiSuggestionsSpy).toHaveBeenCalled()
     expect(component.suggestions).toEqual({
       tags: [42, 43],
       suggested_tags: [],
@@ -2191,10 +2221,20 @@ describe('DocumentDetailComponent', () => {
     expect(createElementSpy).toHaveBeenCalledWith('iframe')
     expect(appendChildSpy).toHaveBeenCalledWith(mockIframe)
     expect(createObjectURLSpy).toHaveBeenCalledWith(blob)
+    expect(mockIframe.style).toEqual({
+      position: 'fixed',
+      right: '0',
+      bottom: '0',
+      width: '0',
+      height: '0',
+      border: '0',
+      visibility: 'hidden',
+    })
 
     if (mockIframe.onload) {
       mockIframe.onload({} as any)
     }
+    tick()
 
     expect(mockContentWindow.focus).toHaveBeenCalled()
     expect(mockContentWindow.print).toHaveBeenCalled()
@@ -2307,6 +2347,7 @@ describe('DocumentDetailComponent', () => {
           mockIframe.onload(new Event('load'))
         }
 
+        tick()
         tick(200)
 
         if (expectToast) {

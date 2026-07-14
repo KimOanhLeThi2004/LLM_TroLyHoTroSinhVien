@@ -8,11 +8,14 @@ import zipfile
 from collections import defaultdict
 from collections import deque
 from datetime import datetime
+from datetime import timedelta
+from http import HTTPStatus
 from pathlib import Path
 from time import mktime
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Literal
+from typing import NamedTuple
 from unicodedata import normalize
 from urllib.parse import quote
 from urllib.parse import urlparse
@@ -20,7 +23,6 @@ from urllib.parse import urlparse
 import httpx
 import magic
 import pathvalidate
-from celery import states
 from django.conf import settings
 from django.contrib.auth.models import Group
 from django.contrib.auth.models import User
@@ -29,6 +31,7 @@ from django.core.cache import cache
 from django.db import connections
 from django.db.migrations.loader import MigrationLoader
 from django.db.migrations.recorder import MigrationRecorder
+from django.db.models import Avg
 from django.db.models import Case
 from django.db.models import Count
 from django.db.models import F
@@ -38,6 +41,7 @@ from django.db.models import Model
 from django.db.models import OuterRef
 from django.db.models import Prefetch
 from django.db.models import Q
+from django.db.models import QuerySet
 from django.db.models import Subquery
 from django.db.models import Sum
 from django.db.models import When
@@ -63,9 +67,9 @@ from django.views import View
 from django.views.decorators.cache import cache_control
 from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import condition
-from django.views.decorators.http import last_modified
 from django.views.generic import TemplateView
 from django_filters.rest_framework import DjangoFilterBackend
+from drf_spectacular.openapi import AutoSchema
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import OpenApiParameter
 from drf_spectacular.utils import extend_schema
@@ -119,6 +123,7 @@ from documents.conditionals import preview_etag
 from documents.conditionals import preview_last_modified
 from documents.conditionals import suggestions_etag
 from documents.conditionals import suggestions_last_modified
+from documents.conditionals import thumbnail_etag
 from documents.conditionals import thumbnail_last_modified
 from documents.data_models import ConsumableDocument
 from documents.data_models import DocumentMetadataOverrides
@@ -172,6 +177,7 @@ from documents.permissions import has_system_status_permission
 from documents.permissions import set_permissions_for_object
 from documents.plugins.date_parsing import get_date_parser
 from documents.schema import generate_object_with_permissions_schema
+from documents.search import SearchHit
 from documents.serialisers import AcknowledgeTasksViewSerializer
 from documents.serialisers import BulkDownloadSerializer
 from documents.serialisers import BulkEditObjectsSerializer
@@ -192,7 +198,7 @@ from documents.serialisers import PostDocumentSerializer
 from documents.serialisers import RemovePasswordDocumentsSerializer
 from documents.serialisers import ReprocessDocumentsSerializer
 from documents.serialisers import RotateDocumentsSerializer
-from documents.serialisers import RunTaskViewSerializer
+from documents.serialisers import RunTaskSerializer
 from documents.serialisers import SavedViewSerializer
 from documents.serialisers import SearchResultSerializer
 from documents.serialisers import SerializerWithPerms
@@ -201,7 +207,9 @@ from documents.serialisers import ShareLinkSerializer
 from documents.serialisers import StoragePathSerializer
 from documents.serialisers import StoragePathTestSerializer
 from documents.serialisers import TagSerializer
-from documents.serialisers import TasksViewSerializer
+from documents.serialisers import TaskSerializerV9
+from documents.serialisers import TaskSerializerV10
+from documents.serialisers import TaskSummarySerializer
 from documents.serialisers import TrashSerializer
 from documents.serialisers import UiSettingsViewSerializer
 from documents.serialisers import WorkflowActionSerializer
@@ -211,7 +219,6 @@ from documents.signals import document_updated
 from documents.tasks import build_share_link_bundle
 from documents.tasks import consume_file
 from documents.tasks import empty_trash
-from documents.tasks import index_optimize
 from documents.tasks import llmindex_index
 from documents.tasks import sanity_check
 from documents.tasks import train_classifier
@@ -249,7 +256,66 @@ from paperless_mail.serialisers import MailRuleSerializer
 if settings.AUDIT_LOG_ENABLED:
     from auditlog.models import LogEntry
 
+
 logger = logging.getLogger("paperless.api")
+
+# Crossover point for intersect_and_order: below this count use a targeted
+# IN-clause query; at or above this count fall back to a full-table scan +
+# Python set intersection.  The IN-clause is faster for small result sets but
+# degrades on SQLite with thousands of parameters.  PostgreSQL handles large IN
+# clauses efficiently, so this threshold mainly protects SQLite users.
+_TANTIVY_INTERSECT_THRESHOLD = 5_000
+_TANTIVY_SEARCH_PARAM_NAMES = ("text", "title_search", "query", "more_like_id")
+
+
+def _get_tantivy_query_and_mode(params):
+    from documents.search import SearchMode
+
+    if "text" in params:
+        return str(params["text"]), SearchMode.TEXT
+    if "title_search" in params:
+        return str(params["title_search"]), SearchMode.TITLE
+    if "query" in params:
+        return str(params["query"]), SearchMode.QUERY
+    return None  # pragma: no cover
+
+
+def _get_more_like_id(query_params: dict[str, Any], user: User | None) -> int:
+    try:
+        more_like_doc_id = int(query_params["more_like_id"])
+        more_like_doc = Document.objects.select_related("owner").get(
+            pk=more_like_doc_id,
+        )
+    except (TypeError, ValueError, Document.DoesNotExist):
+        raise PermissionDenied(_("Invalid more_like_id"))
+
+    if user and not has_perms_owner_aware(
+        user,
+        "view_document",
+        more_like_doc,
+    ):
+        raise PermissionDenied(_("Insufficient permissions."))
+
+    return more_like_doc_id
+
+
+class SearchParams(NamedTuple):
+    sort_field_name: str | None
+    sort_reverse: bool
+    use_tantivy_sort: bool
+    page_num: int
+    page_size: int
+
+
+class SearchResultPage(NamedTuple):
+    ordered_ids: list[int]
+    hits: list[SearchHit]
+    page_offset: int
+
+
+class ResolvedRequestDocs(NamedTuple):
+    request_doc: Document
+    root_doc: Document
 
 
 class IndexView(TemplateView):
@@ -271,8 +337,7 @@ class IndexView(TemplateView):
             first = lang[: lang.index("-")]
             second = lang[lang.index("-") + 1 :]
             return f"{first}-{second.upper()}"
-        else:
-            return lang
+        return lang
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
@@ -417,9 +482,7 @@ class BulkPermissionMixin:
 
 
 class PermissionsAwareDocumentCountMixin(BulkPermissionMixin, PassUserMixin):
-    """
-    Mixin to add document count to queryset, permissions-aware if needed
-    """
+    """Mixin to add document count to queryset, permissions-aware if needed"""
 
     # Default is simple relation path, override for through-table/count specialization.
     document_count_through: type[Model] | None = None
@@ -681,18 +744,49 @@ class EmailDocumentDetailSchema(EmailSerializer):
                     "original_mime_type": serializers.CharField(),
                     "media_filename": serializers.CharField(),
                     "has_archive_version": serializers.BooleanField(),
-                    "original_metadata": serializers.DictField(),
-                    "archive_checksum": serializers.CharField(),
-                    "archive_media_filename": serializers.CharField(),
+                    "original_metadata": serializers.ListField(
+                        child=inline_serializer(
+                            name="OriginalMetadataEntry",
+                            fields={
+                                "namespace": serializers.CharField(),
+                                "prefix": serializers.CharField(),
+                                "key": serializers.CharField(),
+                                "value": serializers.CharField(),
+                            },
+                        ),
+                    ),
+                    "archive_checksum": serializers.CharField(
+                        allow_null=True,
+                        required=False,
+                    ),
+                    "archive_media_filename": serializers.CharField(
+                        allow_null=True,
+                        required=False,
+                    ),
                     "original_filename": serializers.CharField(),
-                    "archive_size": serializers.IntegerField(),
-                    "archive_metadata": serializers.DictField(),
+                    "archive_size": serializers.IntegerField(
+                        allow_null=True,
+                        required=False,
+                    ),
+                    "archive_metadata": serializers.ListField(
+                        child=inline_serializer(
+                            name="ArchiveMetadataEntry",
+                            fields={
+                                "namespace": serializers.CharField(),
+                                "prefix": serializers.CharField(),
+                                "key": serializers.CharField(),
+                                "value": serializers.CharField(),
+                            },
+                        ),
+                        allow_null=True,
+                        required=False,
+                    ),
                     "lang": serializers.CharField(),
                 },
             ),
-            400: None,
-            403: None,
-            404: None,
+            HTTPStatus.BAD_REQUEST: None,
+            HTTPStatus.FORBIDDEN: None,
+            HTTPStatus.NOT_FOUND: None,
         },
     ),
     notes=extend_schema(
@@ -735,6 +829,43 @@ class EmailDocumentDetailSchema(EmailSerializer):
                     ),
                     "storage_paths": serializers.ListField(
                         child=serializers.IntegerField(),
+                    ),
+                    "dates": serializers.ListField(child=serializers.CharField()),
+                },
+            ),
+            400: None,
+            403: None,
+            404: None,
+        },
+    ),
+    ai_suggestions=extend_schema(
+        description="View AI suggestions for the document",
+        responses={
+            200: inline_serializer(
+                name="AISuggestions",
+                fields={
+                    "title": serializers.CharField(allow_null=True),
+                    "correspondents": serializers.ListField(
+                        child=serializers.IntegerField(),
+                    ),
+                    "suggested_correspondents": serializers.ListField(
+                        child=serializers.CharField(),
+                    ),
+                    "tags": serializers.ListField(child=serializers.IntegerField()),
+                    "suggested_tags": serializers.ListField(
+                        child=serializers.CharField(),
+                    ),
+                    "document_types": serializers.ListField(
+                        child=serializers.IntegerField(),
+                    ),
+                    "suggested_document_types": serializers.ListField(
+                        child=serializers.CharField(),
+                    ),
+                    "storage_paths": serializers.ListField(
+                        child=serializers.IntegerField(),
+                    ),
+                    "suggested_storage_paths": serializers.ListField(
+                        child=serializers.CharField(),
                     ),
                     "dates": serializers.ListField(child=serializers.CharField()),
                 },
@@ -928,7 +1059,10 @@ class DocumentViewSet(
                     ),
                 ),
                 "tags",
-                "custom_fields",
+                Prefetch(
+                    "custom_fields",
+                    queryset=CustomFieldInstance.objects.select_related("field"),
+                ),
                 "notes",
             )
         )
@@ -1130,7 +1264,7 @@ class DocumentViewSet(
         request: Request,
         *,
         include_deleted: bool = False,
-    ) -> tuple[Document, Document] | HttpResponseForbidden:
+    ) -> ResolvedRequestDocs | HttpResponseForbidden:
         manager = Document.global_objects if include_deleted else Document.objects
         try:
             request_doc = manager.select_related(
@@ -1150,7 +1284,7 @@ class DocumentViewSet(
             root_doc,
         ):
             return HttpResponseForbidden("Insufficient permissions")
-        return request_doc, root_doc
+        return ResolvedRequestDocs(request_doc=request_doc, root_doc=root_doc)
 
     def file_response(self, pk, request, disposition):
         resolved = self._resolve_request_and_root_doc(
@@ -1160,8 +1294,11 @@ class DocumentViewSet(
         )
         if isinstance(resolved, HttpResponseForbidden):
             return resolved
-        request_doc, root_doc = resolved
-        file_doc = self._get_effective_file_doc(request_doc, root_doc, request)
+        file_doc = self._get_effective_file_doc(
+            resolved.request_doc,
+            resolved.root_doc,
+            request,
+        )
         return serve_file(
             doc=file_doc,
             use_archive=not self.original_requested(request)
@@ -1193,8 +1330,7 @@ class DocumentViewSet(
     def get_filesize(self, filename):
         if Path(filename).is_file():
             return Path(filename).stat().st_size
-        else:
-            return None
+        return None
 
     @action(methods=["get"], detail=True, filter_backends=[])
     @method_decorator(cache_control(no_cache=True))
@@ -1205,11 +1341,14 @@ class DocumentViewSet(
         resolved = self._resolve_request_and_root_doc(pk, request)
         if isinstance(resolved, HttpResponseForbidden):
             return resolved
-        request_doc, root_doc = resolved
 
         # Choose the effective document (newest version by default,
         # or explicit via ?version=).
-        doc = self._get_effective_file_doc(request_doc, root_doc, request)
+        doc = self._get_effective_file_doc(
+            resolved.request_doc,
+            resolved.root_doc,
+            request,
+        )
 
         document_cached_metadata = get_metadata_cache(doc.pk)
 
@@ -1274,104 +1413,154 @@ class DocumentViewSet(
         ):
             return HttpResponseForbidden("Insufficient permissions")
 
+        document_suggestions = get_suggestion_cache(doc.pk)
+
+        if document_suggestions is not None:
+            refresh_suggestions_cache(doc.pk)
+            return Response(document_suggestions.suggestions)
+
+        classifier = load_classifier()
+
+        dates = []
+        if settings.NUMBER_OF_SUGGESTED_DATES > 0:
+            with get_date_parser() as date_parser:
+                gen = date_parser.parse(doc.filename, doc.content)
+                dates = sorted(
+                    {
+                        i
+                        for i in itertools.islice(
+                            gen,
+                            settings.NUMBER_OF_SUGGESTED_DATES,
+                        )
+                    },
+                )
+
+        resp_data = {
+            "correspondents": [
+                c.id for c in match_correspondents(doc, classifier, request.user)
+            ],
+            "tags": [t.id for t in match_tags(doc, classifier, request.user)],
+            "document_types": [
+                dt.id for dt in match_document_types(doc, classifier, request.user)
+            ],
+            "storage_paths": [
+                dt.id for dt in match_storage_paths(doc, classifier, request.user)
+            ],
+            "dates": [date.strftime("%Y-%m-%d") for date in dates if date is not None],
+        }
+
+        # Cache the suggestions and the classifier hash for later
+        set_suggestions_cache(doc.pk, resp_data, classifier)
+
+        return Response(resp_data)
+
+    @action(
+        methods=["get"],
+        detail=True,
+        filter_backends=[],
+        url_path="ai_suggestions",
+    )
+    @method_decorator(cache_control(no_cache=True))
+    def ai_suggestions(self, request, pk=None):
+        doc = get_object_or_404(
+            Document.objects.select_related("owner").prefetch_related("versions"),
+            pk=pk,
+        )
+        if request.user is not None and not has_perms_owner_aware(
+            request.user,
+            "view_document",
+            doc,
+        ):
+            return HttpResponseForbidden("Insufficient permissions")
+
         ai_config = AIConfig()
+        if not ai_config.ai_enabled:
+            return HttpResponseBadRequest("AI is required for this feature")
 
-        if ai_config.ai_enabled:
-            cached_llm_suggestions = get_llm_suggestion_cache(
+        output_language = ai_config.llm_output_language
+        if (
+            not output_language
+            and hasattr(request.user, "ui_settings")
+            and isinstance(
+                request.user.ui_settings.settings,
+                dict,
+            )
+        ):
+            output_language = request.user.ui_settings.settings.get("language") or None
+        llm_cache_backend = (
+            f"{ai_config.llm_backend}:{output_language}"
+            if output_language
+            else ai_config.llm_backend
+        )
+
+        cached_llm_suggestions = get_llm_suggestion_cache(
+            doc.pk,
+            backend=llm_cache_backend,
+        )
+
+        if cached_llm_suggestions:
+            refresh_suggestions_cache(doc.pk)
+            return Response(cached_llm_suggestions.suggestions)
+
+        try:
+            llm_suggestions = get_ai_document_classification(
+                doc,
+                request.user,
+                output_language,
+            )
+        except ValueError as exc:
+            logger.exception(
+                "Invalid AI configuration while generating suggestions for "
+                "document %s: %s",
                 doc.pk,
-                backend=ai_config.llm_backend,
+                exc,
+                exc_info=True,
             )
+            raise ValidationError({"ai": [_("Invalid AI configuration.")]}) from exc
 
-            if cached_llm_suggestions:
-                refresh_suggestions_cache(doc.pk)
-                return Response(cached_llm_suggestions.suggestions)
+        matched_tags = match_tags_by_name(
+            llm_suggestions.get("tags", []),
+            request.user,
+        )
+        matched_correspondents = match_correspondents_by_name(
+            llm_suggestions.get("correspondents", []),
+            request.user,
+        )
+        matched_types = match_document_types_by_name(
+            llm_suggestions.get("document_types", []),
+            request.user,
+        )
+        matched_paths = match_storage_paths_by_name(
+            llm_suggestions.get("storage_paths", []),
+            request.user,
+        )
 
-            llm_suggestions = get_ai_document_classification(doc, request.user)
-
-            matched_tags = match_tags_by_name(
+        resp_data = {
+            "title": llm_suggestions.get("title"),
+            "tags": [t.id for t in matched_tags],
+            "suggested_tags": extract_unmatched_names(
                 llm_suggestions.get("tags", []),
-                request.user,
-            )
-            matched_correspondents = match_correspondents_by_name(
+                matched_tags,
+            ),
+            "correspondents": [c.id for c in matched_correspondents],
+            "suggested_correspondents": extract_unmatched_names(
                 llm_suggestions.get("correspondents", []),
-                request.user,
-            )
-            matched_types = match_document_types_by_name(
+                matched_correspondents,
+            ),
+            "document_types": [d.id for d in matched_types],
+            "suggested_document_types": extract_unmatched_names(
                 llm_suggestions.get("document_types", []),
-                request.user,
-            )
-            matched_paths = match_storage_paths_by_name(
+                matched_types,
+            ),
+            "storage_paths": [s.id for s in matched_paths],
+            "suggested_storage_paths": extract_unmatched_names(
                 llm_suggestions.get("storage_paths", []),
-                request.user,
-            )
+                matched_paths,
+            ),
+            "dates": llm_suggestions.get("dates", []),
+        }
 
-            resp_data = {
-                "title": llm_suggestions.get("title"),
-                "tags": [t.id for t in matched_tags],
-                "suggested_tags": extract_unmatched_names(
-                    llm_suggestions.get("tags", []),
-                    matched_tags,
-                ),
-                "correspondents": [c.id for c in matched_correspondents],
-                "suggested_correspondents": extract_unmatched_names(
-                    llm_suggestions.get("correspondents", []),
-                    matched_correspondents,
-                ),
-                "document_types": [d.id for d in matched_types],
-                "suggested_document_types": extract_unmatched_names(
-                    llm_suggestions.get("document_types", []),
-                    matched_types,
-                ),
-                "storage_paths": [s.id for s in matched_paths],
-                "suggested_storage_paths": extract_unmatched_names(
-                    llm_suggestions.get("storage_paths", []),
-                    matched_paths,
-                ),
-                "dates": llm_suggestions.get("dates", []),
-            }
-
-            set_llm_suggestions_cache(doc.pk, resp_data, backend=ai_config.llm_backend)
-        else:
-            document_suggestions = get_suggestion_cache(doc.pk)
-
-            if document_suggestions is not None:
-                refresh_suggestions_cache(doc.pk)
-                return Response(document_suggestions.suggestions)
-
-            classifier = load_classifier()
-
-            dates = []
-            if settings.NUMBER_OF_SUGGESTED_DATES > 0:
-                with get_date_parser() as date_parser:
-                    gen = date_parser.parse(doc.filename, doc.content)
-                    dates = sorted(
-                        {
-                            i
-                            for i in itertools.islice(
-                                gen,
-                                settings.NUMBER_OF_SUGGESTED_DATES,
-                            )
-                        },
-                    )
-
-            resp_data = {
-                "correspondents": [
-                    c.id for c in match_correspondents(doc, classifier, request.user)
-                ],
-                "tags": [t.id for t in match_tags(doc, classifier, request.user)],
-                "document_types": [
-                    dt.id for dt in match_document_types(doc, classifier, request.user)
-                ],
-                "storage_paths": [
-                    dt.id for dt in match_storage_paths(doc, classifier, request.user)
-                ],
-                "dates": [
-                    date.strftime("%Y-%m-%d") for date in dates if date is not None
-                ],
-            }
-
-            # Cache the suggestions and the classifier hash for later
-            set_suggestions_cache(doc.pk, resp_data, classifier)
+        set_llm_suggestions_cache(doc.pk, resp_data, backend=llm_cache_backend)
 
         return Response(resp_data)
 
@@ -1381,13 +1570,16 @@ class DocumentViewSet(
         condition(etag_func=preview_etag, last_modified_func=preview_last_modified),
     )
     def preview(self, request, pk=None):
-        resolved = self._resolve_request_and_root_doc(pk, request)
+        resolved = self._resolve_request_and_root_doc(pk, request, include_deleted=True)
         if isinstance(resolved, HttpResponseForbidden):
             return resolved
-        request_doc, root_doc = resolved
 
         try:
-            file_doc = self._get_effective_file_doc(request_doc, root_doc, request)
+            file_doc = self._get_effective_file_doc(
+                resolved.request_doc,
+                resolved.root_doc,
+                request,
+            )
 
             return serve_file(
                 doc=file_doc,
@@ -1400,18 +1592,26 @@ class DocumentViewSet(
 
     @action(methods=["get"], detail=True, filter_backends=[])
     @method_decorator(cache_control(no_cache=True))
-    @method_decorator(last_modified(thumbnail_last_modified))
+    @method_decorator(
+        condition(
+            etag_func=thumbnail_etag,
+            last_modified_func=thumbnail_last_modified,
+        ),
+    )
     def thumb(self, request, pk=None):
-        resolved = self._resolve_request_and_root_doc(pk, request)
+        resolved = self._resolve_request_and_root_doc(pk, request, include_deleted=True)
         if isinstance(resolved, HttpResponseForbidden):
             return resolved
-        request_doc, root_doc = resolved
 
         try:
-            file_doc = self._get_effective_file_doc(request_doc, root_doc, request)
+            file_doc = self._get_effective_file_doc(
+                resolved.request_doc,
+                resolved.root_doc,
+                request,
+            )
             handle = file_doc.thumbnail_file
 
-            return HttpResponse(handle, content_type="image/webp")
+            return FileResponse(handle, content_type="image/webp")
         except FileNotFoundError:
             raise Http404
 
@@ -1486,7 +1686,7 @@ class DocumentViewSet(
                     )
 
                 doc.modified = timezone.now()
-                doc.save()
+                doc.save(update_fields=["modified"])
 
                 from documents.search import get_backend
 
@@ -1510,7 +1710,14 @@ class DocumentViewSet(
             ):
                 return HttpResponseForbidden("Insufficient permissions to delete notes")
 
-            note = Note.objects.get(id=int(request.GET.get("id")), document=doc)
+            note_id = request.GET.get("id")
+            if not note_id:
+                raise ValidationError({"id": "This field is required."})
+            try:
+                note_id_int = int(note_id)
+            except ValueError:
+                raise ValidationError({"id": "A valid integer is required."})
+            note = get_object_or_404(Note, id=note_id_int, document=doc)
             if settings.AUDIT_LOG_ENABLED:
                 LogEntry.objects.log_create(
                     instance=doc,
@@ -1523,7 +1730,7 @@ class DocumentViewSet(
             note.delete()
 
             doc.modified = timezone.now()
-            doc.save()
+            doc.save(update_fields=["modified"])
 
             from documents.search import get_backend
 
@@ -1761,9 +1968,9 @@ class DocumentViewSet(
             if request.user is not None:
                 overrides.actor_id = request.user.id
 
-            async_task = consume_file.delay(
-                input_doc,
-                overrides,
+            async_task = consume_file.apply_async(
+                kwargs={"input_doc": input_doc, "overrides": overrides},
+                headers={"trigger_source": PaperlessTask.TriggerSource.WEB_UI},
             )
             logger.debug(
                 f"Updated document {root_doc.id} with new version",
@@ -1958,8 +2165,8 @@ class DocumentViewSet(
         )
 
 
-class ChatStreamingSerializer(serializers.Serializer):
-    q = serializers.CharField(required=True)
+class ChatStreamingSerializer(serializers.Serializer[dict[str, Any]]):
+    q = serializers.CharField(required=True, max_length=4000)
     document_id = serializers.IntegerField(required=False, allow_null=True)
 
 
@@ -1971,7 +2178,7 @@ class ChatStreamingSerializer(serializers.Serializer):
     name="dispatch",
 )
 class ChatStreamingView(GenericAPIView[Any]):
-    permission_classes = (IsAuthenticated,)
+    permission_classes = (IsAuthenticated, ViewDocumentsPermissions)
     serializer_class = ChatStreamingSerializer
 
     def post(self, request, *args, **kwargs):
@@ -1980,12 +2187,11 @@ class ChatStreamingView(GenericAPIView[Any]):
         if not ai_config.ai_enabled:
             return HttpResponseBadRequest("AI is required for this feature")
 
-        try:
-            question = request.data["q"]
-        except KeyError:
-            return HttpResponseBadRequest("Invalid request")
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        question = serializer.validated_data["q"]
 
-        doc_id = request.data.get("document_id")
+        doc_id = serializer.validated_data.get("document_id")
 
         if doc_id:
             try:
@@ -2057,18 +2263,17 @@ class ChatStreamingView(GenericAPIView[Any]):
     ),
 )
 class UnifiedSearchViewSet(DocumentViewSet):
-    SEARCH_PARAM_NAMES = ("text", "title_search", "query", "more_like_id")
-
     def get_serializer_class(self):
         if self._is_search_request():
             return SearchResultSerializer
-        else:
-            return DocumentSerializer
+        return DocumentSerializer
 
     def _get_active_search_params(self, request: Request | None = None) -> list[str]:
         request = request or self.request
         return [
-            param for param in self.SEARCH_PARAM_NAMES if param in request.query_params
+            param
+            for param in _TANTIVY_SEARCH_PARAM_NAMES
+            if param in request.query_params
         ]
 
     def _is_search_request(self):
@@ -2078,19 +2283,15 @@ class UnifiedSearchViewSet(DocumentViewSet):
         if not self._is_search_request():
             return super().list(request)
 
-        from documents.search import SearchMode
+        from documents.search import SearchHit
+        from documents.search import TantivyBackend
         from documents.search import TantivyRelevanceList
         from documents.search import get_backend
 
-        try:
-            backend = get_backend()
-            # ORM-filtered queryset: permissions + field filters + ordering (DRF backends applied)
-            filtered_qs = self.filter_queryset(self.get_queryset())
-
-            user = None if request.user.is_superuser else request.user
-            active_search_params = self._get_active_search_params(request)
-
-            if len(active_search_params) > 1:
+        def parse_search_params() -> SearchParams:
+            """Extract query string, search mode, and ordering from request."""
+            active = self._get_active_search_params(request)
+            if len(active) > 1:
                 raise ValidationError(
                     {
                         "detail": _(
@@ -2099,73 +2300,150 @@ class UnifiedSearchViewSet(DocumentViewSet):
                     },
                 )
 
-            if (
-                "text" in request.query_params
-                or "title_search" in request.query_params
-                or "query" in request.query_params
-            ):
-                if "text" in request.query_params:
-                    search_mode = SearchMode.TEXT
-                    query_str = request.query_params["text"]
-                elif "title_search" in request.query_params:
-                    search_mode = SearchMode.TITLE
-                    query_str = request.query_params["title_search"]
-                else:
-                    search_mode = SearchMode.QUERY
-                    query_str = request.query_params["query"]
-                results = backend.search(
-                    query_str,
-                    user=user,
-                    page=1,
-                    page_size=10000,
-                    sort_field=None,
-                    sort_reverse=False,
-                    search_mode=search_mode,
-                )
-            else:
-                # more_like_id — validate permission on the seed document first
-                try:
-                    more_like_doc_id = int(request.query_params["more_like_id"])
-                    more_like_doc = Document.objects.select_related("owner").get(
-                        pk=more_like_doc_id,
+            ordering_param = request.query_params.get("ordering", "")
+            sort_reverse = ordering_param.startswith("-")
+            sort_field_name = ordering_param.lstrip("-") or None
+            # "score" means relevance order — Tantivy handles it natively,
+            # so treat it as a Tantivy sort to preserve the ranked order through
+            # the ORM intersection step.
+            use_tantivy_sort = (
+                sort_field_name in TantivyBackend.SORTABLE_FIELDS
+                or sort_field_name is None
+                or sort_field_name == "score"
+            )
+
+            try:
+                page_num = int(request.query_params.get("page", 1))
+            except (TypeError, ValueError):
+                page_num = 1
+            page_size = (
+                self.paginator.get_page_size(request) or self.paginator.page_size
+            )
+
+            return SearchParams(
+                sort_field_name=sort_field_name,
+                sort_reverse=sort_reverse,
+                use_tantivy_sort=use_tantivy_sort,
+                page_num=page_num,
+                page_size=page_size,
+            )
+
+        def intersect_and_order(
+            all_ids: list[int],
+            filtered_qs: QuerySet[Document],
+            *,
+            use_tantivy_sort: bool,
+        ) -> list[int]:
+            """Intersect search IDs with ORM-visible IDs, preserving order."""
+            if not all_ids:
+                return []
+            if use_tantivy_sort:
+                if len(all_ids) <= _TANTIVY_INTERSECT_THRESHOLD:
+                    # Small result set: targeted IN-clause avoids a full-table scan.
+                    visible_ids = set(
+                        filtered_qs.filter(pk__in=all_ids).values_list("pk", flat=True),
                     )
-                except (TypeError, ValueError, Document.DoesNotExist):
-                    raise PermissionDenied(_("Invalid more_like_id"))
+                else:
+                    # Large result set: full-table scan + Python intersection is faster
+                    # than a large IN-clause on SQLite.
+                    visible_ids = set(
+                        filtered_qs.values_list("pk", flat=True),
+                    )
+                return [doc_id for doc_id in all_ids if doc_id in visible_ids]
+            return list(
+                filtered_qs.filter(id__in=all_ids).values_list("pk", flat=True),
+            )
 
-                if not has_perms_owner_aware(
-                    request.user,
-                    "view_document",
-                    more_like_doc,
-                ):
-                    raise PermissionDenied(_("Insufficient permissions."))
+        def run_text_search(
+            backend: TantivyBackend,
+            user: User | None,
+            filtered_qs: QuerySet[Document],
+        ) -> SearchResultPage:
+            """Handle text/title/query search: IDs, ORM intersection, page highlights."""
+            query_str, search_mode = _get_tantivy_query_and_mode(request.query_params)
 
-                results = backend.more_like_this(
-                    more_like_doc_id,
-                    user=user,
-                    page=1,
-                    page_size=10000,
-                )
+            # "score" is not a real Tantivy sort field — it means relevance order,
+            # which is Tantivy's default when no sort field is specified.
+            is_score_sort = sort_field_name == "score"
+            all_ids = backend.search_ids(
+                query_str,
+                user=user,
+                sort_field=(
+                    None if (not use_tantivy_sort or is_score_sort) else sort_field_name
+                ),
+                sort_reverse=sort_reverse,
+                search_mode=search_mode,
+            )
+            ordered_ids = intersect_and_order(
+                all_ids,
+                filtered_qs,
+                use_tantivy_sort=use_tantivy_sort,
+            )
+            # Tantivy returns relevance results best-first (descending score).
+            # ordering=score (ascending, worst-first) requires a reversal.
+            if is_score_sort and not sort_reverse:
+                ordered_ids = list(reversed(ordered_ids))
 
-            hits_by_id = {h["id"]: h for h in results.hits}
+            page_offset = (page_num - 1) * page_size
+            page_ids = ordered_ids[page_offset : page_offset + page_size]
+            page_hits = backend.highlight_hits(
+                query_str,
+                page_ids,
+                search_mode=search_mode,
+                rank_start=page_offset + 1,
+            )
+            return SearchResultPage(
+                ordered_ids=ordered_ids,
+                hits=page_hits,
+                page_offset=page_offset,
+            )
 
-            # Determine sort order: no ordering param -> Tantivy relevance; otherwise -> ORM order
-            ordering_param = request.query_params.get("ordering", "").lstrip("-")
-            if not ordering_param:
-                # Preserve Tantivy relevance order; intersect with ORM-visible IDs
-                orm_ids = set(filtered_qs.values_list("pk", flat=True))
-                ordered_hits = [h for h in results.hits if h["id"] in orm_ids]
+        def run_more_like_this(
+            backend: TantivyBackend,
+            user: User | None,
+            filtered_qs: QuerySet[Document],
+        ) -> SearchResultPage:
+            """Handle more_like_id search: permission check, IDs, stub hits."""
+            more_like_doc_id = _get_more_like_id(request.query_params, user)
+
+            all_ids = backend.more_like_this_ids(more_like_doc_id, user=user)
+            ordered_ids = intersect_and_order(
+                all_ids,
+                filtered_qs,
+                use_tantivy_sort=True,
+            )
+
+            page_offset = (page_num - 1) * page_size
+            page_ids = ordered_ids[page_offset : page_offset + page_size]
+            page_hits = [
+                SearchHit(id=doc_id, score=0.0, rank=rank, highlights={})
+                for rank, doc_id in enumerate(page_ids, start=page_offset + 1)
+            ]
+            return SearchResultPage(
+                ordered_ids=ordered_ids,
+                hits=page_hits,
+                page_offset=page_offset,
+            )
+
+        try:
+            sort_field_name, sort_reverse, use_tantivy_sort, page_num, page_size = (
+                parse_search_params()
+            )
+
+            backend = get_backend()
+            filtered_qs = self.filter_queryset(self.get_queryset())
+            user = None if request.user.is_superuser else request.user
+
+            if "more_like_id" in request.query_params:
+                result = run_more_like_this(backend, user, filtered_qs)
             else:
-                # Use ORM ordering (already applied by DocumentsOrderingFilter)
-                hit_ids = set(hits_by_id.keys())
-                orm_ordered_ids = filtered_qs.filter(id__in=hit_ids).values_list(
-                    "pk",
-                    flat=True,
-                )
-                ordered_hits = [
-                    hits_by_id[pk] for pk in orm_ordered_ids if pk in hits_by_id
-                ]
+                result = run_text_search(backend, user, filtered_qs)
 
-            rl = TantivyRelevanceList(ordered_hits)
+            rl = TantivyRelevanceList(
+                result.ordered_ids,
+                result.hits,
+                result.page_offset,
+            )
             page = self.paginate_queryset(rl)
 
             if page is not None:
@@ -2175,15 +2453,18 @@ class UnifiedSearchViewSet(DocumentViewSet):
                 if get_boolean(
                     str(request.query_params.get("include_selection_data", "false")),
                 ):
-                    all_ids = [h["id"] for h in ordered_hits]
+                    # NOTE: pk__in=ordered_ids generates a large SQL IN clause
+                    # for big result sets.  Acceptable today but may need a temp
+                    # table or chunked approach if selection_data becomes slow
+                    # at scale (tens of thousands of matching documents).
                     response.data["selection_data"] = (
                         self._get_selection_data_for_queryset(
-                            filtered_qs.filter(pk__in=all_ids),
+                            filtered_qs.filter(pk__in=result.ordered_ids),
                         )
                     )
                 return response
 
-            serializer = self.get_serializer(ordered_hits, many=True)
+            serializer = self.get_serializer(result.hits, many=True)
             return Response(serializer.data)
 
         except NotFound:
@@ -2313,6 +2594,48 @@ class SavedViewViewSet(BulkPermissionMixin, PassUserMixin, ModelViewSet[SavedVie
 
 
 class DocumentSelectionMixin:
+    def _get_search_document_ids(
+        self,
+        *,
+        user: User,
+        filters: dict[str, Any],
+    ) -> list[int] | None:
+        search_filters = [
+            filter_name
+            for filter_name in _TANTIVY_SEARCH_PARAM_NAMES
+            if filter_name in filters
+        ]
+        if not search_filters:
+            return None
+        if len(search_filters) > 1:
+            raise ValidationError(
+                {
+                    "detail": _(
+                        "Specify only one of text, title_search, query, or more_like_id.",
+                    ),
+                },
+            )
+
+        from documents.search import get_backend
+
+        filter_name = search_filters[0]
+        backend = get_backend()
+        search_user = None if user.is_superuser else user
+
+        if filter_name == "more_like_id":
+            more_like_doc_id = _get_more_like_id(filters, user)
+
+            search_ids = backend.more_like_this_ids(more_like_doc_id, user=search_user)
+        else:
+            query_str, search_mode = _get_tantivy_query_and_mode(filters)
+            search_ids = backend.search_ids(
+                query_str,
+                user=search_user,
+                search_mode=search_mode,
+            )
+
+        return search_ids
+
     def _resolve_document_ids(
         self,
         *,
@@ -2326,19 +2649,29 @@ class DocumentSelectionMixin:
 
         # otherwise, reconstruct the document list based on the provided filters
         filters = validated_data.get("filters") or {}
+        orm_filters = {
+            key: value
+            for key, value in filters.items()
+            if key not in _TANTIVY_SEARCH_PARAM_NAMES
+        }
         permitted_documents = get_objects_for_user_owner_aware(
             user,
             permission_codename,
             Document,
         )
-        return list(
-            DocumentFilterSet(
-                data=filters,
-                queryset=permitted_documents,
-            )
-            .qs.distinct()
-            .values_list("pk", flat=True),
+        # orm-filtered docs
+        filtered_documents = DocumentFilterSet(
+            data=orm_filters,
+            queryset=permitted_documents,
+        ).qs.distinct()
+        # tantivy-filtered docs (if search params provided)
+        search_filtered_ids = self._get_search_document_ids(
+            user=user,
+            filters=filters,
         )
+        if search_filtered_ids is not None:
+            filtered_documents = filtered_documents.filter(pk__in=search_filtered_ids)
+        return list(filtered_documents.values_list("pk", flat=True))
 
 
 class DocumentOperationPermissionMixin(PassUserMixin, DocumentSelectionMixin):
@@ -2352,6 +2685,7 @@ class DocumentOperationPermissionMixin(PassUserMixin, DocumentSelectionMixin):
         "edit_pdf",
         "remove_password",
     }
+    METHOD_NAMES_REQUIRING_TRIGGER_SOURCE = METHOD_NAMES_REQUIRING_USER
 
     def _has_document_permissions(
         self,
@@ -2442,12 +2776,19 @@ class DocumentOperationPermissionMixin(PassUserMixin, DocumentSelectionMixin):
         parameters = {
             k: v
             for k, v in validated_data.items()
-            if k not in {"documents", "all", "filters"}
+            if k not in {"documents", "all", "filters", "from_webui"}
         }
         user = self.request.user
+        from_webui = validated_data.get("from_webui", False)
 
         if method.__name__ in self.METHOD_NAMES_REQUIRING_USER:
             parameters["user"] = user
+        if method.__name__ in self.METHOD_NAMES_REQUIRING_TRIGGER_SOURCE:
+            parameters["trigger_source"] = (
+                PaperlessTask.TriggerSource.WEB_UI
+                if from_webui
+                else PaperlessTask.TriggerSource.API_UPLOAD
+            )
 
         if not self._has_document_permissions(
             user=user,
@@ -2531,12 +2872,19 @@ class BulkEditView(DocumentOperationPermissionMixin):
         user = self.request.user
         method = serializer.validated_data.get("method")
         parameters = serializer.validated_data.get("parameters")
+        from_webui = serializer.validated_data.get("from_webui", False)
         documents = self._resolve_document_ids(
             user=user,
             validated_data=serializer.validated_data,
         )
         if method.__name__ in self.METHOD_NAMES_REQUIRING_USER:
             parameters["user"] = user
+        if method.__name__ in self.METHOD_NAMES_REQUIRING_TRIGGER_SOURCE:
+            parameters["trigger_source"] = (
+                PaperlessTask.TriggerSource.WEB_UI
+                if from_webui
+                else PaperlessTask.TriggerSource.API_UPLOAD
+            )
         if not self._has_document_permissions(
             user=user,
             documents=documents,
@@ -2830,9 +3178,15 @@ class PostDocumentView(GenericAPIView[Any]):
             custom_fields=custom_fields,
         )
 
-        async_task = consume_file.delay(
-            input_doc,
-            input_doc_overrides,
+        async_task = consume_file.apply_async(
+            kwargs={"input_doc": input_doc, "overrides": input_doc_overrides},
+            headers={
+                "trigger_source": (
+                    PaperlessTask.TriggerSource.WEB_UI
+                    if from_webui
+                    else PaperlessTask.TriggerSource.API_UPLOAD
+                ),
+            },
         )
 
         return Response(async_task.id)
@@ -3145,6 +3499,93 @@ class SearchFullTextView(GenericAPIView[Any]):
 
 @extend_schema_view(
     get=extend_schema(
+        description="Run hybrid full-text and semantic search",
+        parameters=[
+            OpenApiParameter(
+                name="query",
+                required=True,
+                type=str,
+                description="Query to search for",
+            ),
+            OpenApiParameter(
+                name="limit",
+                required=False,
+                type=int,
+                description="Number of results to return",
+            ),
+            OpenApiParameter(
+                name="min_score",
+                required=False,
+                type=float,
+                description="Minimum normalized hybrid score",
+            ),
+        ],
+        responses={
+            (200, "application/json"): inline_serializer(
+                name="HybridSearchResults",
+                fields={
+                    "query": serializers.CharField(),
+                    "total": serializers.IntegerField(),
+                    "results": serializers.ListField(
+                        child=serializers.DictField(),
+                    ),
+                },
+            ),
+        },
+    ),
+)
+class SearchHybridView(GenericAPIView[Any]):
+    permission_classes = (IsAuthenticated,)
+
+    def get(self, request, format=None):
+        query = request.query_params.get("query", None)
+        if query is None:
+            return HttpResponseBadRequest("Query required")
+
+        if "limit" in request.query_params:
+            limit = int(request.query_params["limit"])
+            if limit <= 0:
+                return HttpResponseBadRequest("Invalid limit")
+        else:
+            limit = 20
+
+        min_score = None
+        if "min_score" in request.query_params:
+            min_score = float(request.query_params["min_score"])
+
+        from paperless_ai.hybrid_search import hybrid_search
+
+        results = hybrid_search(
+            query,
+            user=request.user,
+            top_k=limit,
+            min_score=min_score,
+        )
+        return Response(
+            {
+                "query": results.query.normalized_query,
+                "total": results.total,
+                "results": [
+                    {
+                        "document_id": hit.document_id,
+                        "rank": hit.rank,
+                        "score": hit.score,
+                        "title": hit.title,
+                        "fulltext_score": hit.fulltext_score,
+                        "semantic_score": hit.semantic_score,
+                        "fulltext_rank": hit.fulltext_rank,
+                        "semantic_rank": hit.semantic_rank,
+                        "matched_channels": hit.matched_channels,
+                        "explanation": hit.explanation,
+                    }
+                    for hit in results.hits
+                ],
+            },
+        )
+
+
+@extend_schema_view(
+    get=extend_schema(
         description="Global search",
         parameters=[
             OpenApiParameter(
@@ -3193,7 +3634,7 @@ class GlobalSearchView(PassUserMixin):
         query = request.query_params.get("query", None)
         if query is None:
             return HttpResponseBadRequest("Query required")
-        elif len(query) < 3:
+        if len(query) < 3:
             return HttpResponseBadRequest("Query must be at least 3 characters")
 
         db_only = request.query_params.get("db_only", False)
@@ -3210,20 +3651,17 @@ class GlobalSearchView(PassUserMixin):
                 docs = all_docs.filter(title__icontains=query)[:OBJECT_LIMIT]
             else:
                 user = None if request.user.is_superuser else request.user
-                fts_results = get_backend().search(
+                matching_ids = get_backend().search_ids(
                     query,
                     user=user,
-                    page=1,
-                    page_size=1000,
-                    sort_field=None,
-                    sort_reverse=False,
                     search_mode=SearchMode.TEXT,
+                    limit=OBJECT_LIMIT * 3,
                 )
-                docs_by_id = all_docs.in_bulk([hit["id"] for hit in fts_results.hits])
+                docs_by_id = all_docs.in_bulk(matching_ids)
                 docs = [
-                    docs_by_id[hit["id"]]
-                    for hit in fts_results.hits
-                    if hit["id"] in docs_by_id
+                    docs_by_id[doc_id]
+                    for doc_id in matching_ids
+                    if doc_id in docs_by_id
                 ][:OBJECT_LIMIT]
         saved_views = (
             get_objects_for_user_owner_aware(
@@ -3416,7 +3854,7 @@ class StatisticsView(GenericAPIView[Any]):
                 "documents.view_document",
                 Document,
             )
-        )
+        ).filter(root_document__isnull=True)
         tags = (
             Tag.objects.all()
             if can_view_global_stats
@@ -3491,7 +3929,7 @@ class StatisticsView(GenericAPIView[Any]):
                 "inbox_tag": (
                     inbox_tag_pks[0] if inbox_tag_pks else None
                 ),  # backwards compatibility
-                "inbox_tags": (inbox_tag_pks if inbox_tag_pks else None),
+                "inbox_tags": (inbox_tag_pks or None),
                 "document_file_type_counts": document_file_type_counts,
                 "character_count": character_count,
                 "tag_count": len(tags),
@@ -3503,6 +3941,16 @@ class StatisticsView(GenericAPIView[Any]):
         )
 
 
+@extend_schema_view(
+    post=extend_schema(
+        operation_id="bulk_download",
+        description="Download multiple documents as a ZIP archive.",
+        responses={
+            (HTTPStatus.OK, "application/zip"): OpenApiTypes.BINARY,
+            HTTPStatus.FORBIDDEN: None,
+        },
+    ),
+)
 class BulkDownloadView(DocumentSelectionMixin, GenericAPIView[Any]):
     permission_classes = (IsAuthenticated,)
     serializer_class = BulkDownloadSerializer
@@ -3525,13 +3973,6 @@ class BulkDownloadView(DocumentSelectionMixin, GenericAPIView[Any]):
             if not has_perms_owner_aware(request.user, "change_document", document):
                 return HttpResponseForbidden("Insufficient permissions")
 
-        settings.SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
-        temp = tempfile.NamedTemporaryFile(  # noqa: SIM115
-            dir=settings.SCRATCH_DIR,
-            suffix="-compressed-archive",
-            delete=False,
-        )
-
         if content == "both":
             strategy_class = OriginalAndArchiveStrategy
         elif content == "originals":
@@ -3539,23 +3980,48 @@ class BulkDownloadView(DocumentSelectionMixin, GenericAPIView[Any]):
         else:
             strategy_class = ArchiveOnlyStrategy
 
-        with zipfile.ZipFile(temp.name, "w", compression) as zipf:
-            strategy = strategy_class(zipf, follow_formatting=follow_filename_format)
-            for document in documents:
-                strategy.add_document(document)
+        settings.SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(
+            dir=settings.SCRATCH_DIR,
+            suffix="-compressed-archive",
+        )
+        os.close(fd)
+        temp_path = Path(temp_name)
 
-        # TODO(stumpylog): Investigate using FileResponse here
-        with Path(temp.name).open("rb") as f:
-            response = HttpResponse(f, content_type="application/zip")
-            response["Content-Disposition"] = '{}; filename="{}"'.format(
-                "attachment",
-                "documents.zip",
-            )
+        try:
+            with zipfile.ZipFile(temp_path, "w", compression) as zipf:
+                strategy = strategy_class(
+                    zipf,
+                    follow_formatting=follow_filename_format,
+                )
+                for document in documents:
+                    strategy.add_document(document)
 
-            return response
+            f = temp_path.open("rb")
+            temp_path.unlink()
+        except Exception:
+            temp_path.unlink(missing_ok=True)
+            raise
+
+        return FileResponse(
+            f,
+            as_attachment=True,
+            filename="documents.zip",
+            content_type="application/zip",
+        )
 
 
-@extend_schema_view(**generate_object_with_permissions_schema(StoragePathSerializer))
+@extend_schema_view(
+    **generate_object_with_permissions_schema(StoragePathSerializer),
+    test=extend_schema(
+        operation_id="storage_paths_test",
+        description="Test a storage path template against a document.",
+        request=StoragePathTestSerializer,
+        responses={
+            (HTTPStatus.OK, "application/json"): OpenApiTypes.STR,
+        },
+    ),
+)
 class StoragePathViewSet(PermissionsAwareDocumentCountMixin, ModelViewSet[StoragePath]):
     model = StoragePath
 
@@ -3592,7 +4058,10 @@ class StoragePathViewSet(PermissionsAwareDocumentCountMixin, ModelViewSet[Storag
         response = super().destroy(request, *args, **kwargs)
 
         if doc_ids:
-            bulk_edit.bulk_update_documents.delay(doc_ids)
+            bulk_edit.bulk_update_documents.apply_async(
+                kwargs={"document_ids": doc_ids},
+                headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
+            )
 
         return response
 
@@ -3757,22 +4226,31 @@ class RemoteVersionView(GenericAPIView[Any]):
         )
 
 
+class _TasksViewSetSchema(AutoSchema):
+    _UNPAGINATED_ACTIONS = frozenset({"summary", "active"})
+
+    def _get_paginator(self):
+        if getattr(self.view, "action", None) in self._UNPAGINATED_ACTIONS:
+            return None
+        return super()._get_paginator()
+
+
 @extend_schema_view(
+    list=extend_schema(
+        parameters=[
+            OpenApiParameter(
+                name="task_id",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="Filter tasks by Celery UUID",
+            ),
+        ],
+    ),
     acknowledge=extend_schema(
         operation_id="acknowledge_tasks",
         description="Acknowledge a list of tasks",
-        request={
-            "application/json": {
-                "type": "object",
-                "properties": {
-                    "tasks": {
-                        "type": "array",
-                        "items": {"type": "integer"},
-                    },
-                },
-                "required": ["tasks"],
-            },
-        },
+        request=AcknowledgeTasksViewSerializer,
         responses={
             (200, "application/json"): inline_serializer(
                 name="AcknowledgeTasks",
@@ -3780,52 +4258,126 @@ class RemoteVersionView(GenericAPIView[Any]):
                     "result": serializers.IntegerField(),
                 },
             ),
-            (400, "application/json"): None,
         },
     ),
-)
-@extend_schema(
-    parameters=[
-        OpenApiParameter(
-            name="task_id",
-            type=str,
-            location=OpenApiParameter.QUERY,
-            required=False,
-            description="Filter tasks by Celery UUID",
-        ),
-    ],
+    run=extend_schema(
+        operation_id="run_task",
+        description="Manually dispatch a background task. Superuser only.",
+        request=RunTaskSerializer,
+        responses={
+            (200, "application/json"): inline_serializer(
+                name="RunTask",
+                fields={"task_id": serializers.CharField()},
+            ),
+            (400, "application/json"): inline_serializer(
+                name="RunTaskError",
+                fields={"error": serializers.CharField()},
+            ),
+        },
+    ),
+    summary=extend_schema(
+        responses={200: TaskSummarySerializer(many=True)},
+        parameters=[
+            OpenApiParameter(
+                name="days",
+                type={"type": "integer", "minimum": 1, "maximum": 365, "default": 30},
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="Number of days to include in aggregation (default 30, min 1, max 365)",
+            ),
+        ],
+    ),
+    active=extend_schema(
+        description="Currently pending and running tasks (capped at 50).",
+        responses={200: TaskSerializerV10(many=True)},
+    ),
 )
 class TasksViewSet(ReadOnlyModelViewSet[PaperlessTask]):
+    schema = _TasksViewSetSchema()
     permission_classes = (IsAuthenticated, PaperlessObjectPermissions)
-    serializer_class = TasksViewSerializer
+    pagination_class = StandardPagination
     filter_backends = (
         DjangoFilterBackend,
         OrderingFilter,
-        ObjectOwnedOrGrantedPermissionsFilter,
     )
     filterset_class = PaperlessTaskFilterSet
+    ordering_fields = [
+        "date_created",
+        "date_done",
+        "status",
+        "task_type",
+        "duration_seconds",
+        "wait_time_seconds",
+    ]
+    ordering = ["-date_created"]
+    # Needed for drf-spectacular schema generation (get_queryset touches request.user)
+    queryset = PaperlessTask.objects.none()
 
-    TASK_AND_ARGS_BY_NAME = {
-        PaperlessTask.TaskName.INDEX_OPTIMIZE: (index_optimize, {}),
-        PaperlessTask.TaskName.TRAIN_CLASSIFIER: (
-            train_classifier,
-            {"scheduled": False},
-        ),
-        PaperlessTask.TaskName.CHECK_SANITY: (
-            sanity_check,
-            {"scheduled": False, "raise_on_error": False},
-        ),
-        PaperlessTask.TaskName.LLMINDEX_UPDATE: (
-            llmindex_index,
-            {"scheduled": False, "rebuild": False},
-        ),
+    # v9 backwards compat: maps old task_name values to new task_type values
+    _V9_TASK_NAME_TO_TYPE = {
+        "check_sanity": PaperlessTask.TaskType.SANITY_CHECK,
+        "llmindex_update": PaperlessTask.TaskType.LLM_INDEX,
     }
 
+    # v9 backwards compat: maps old "type" query param values to new TriggerSource.
+    # Must match the reverse of TaskSerializerV9._TRIGGER_SOURCE_TO_V9_TYPE.
+    _V9_TYPE_TO_TRIGGER_SOURCES = {
+        "auto_task": [
+            PaperlessTask.TriggerSource.SYSTEM,
+            PaperlessTask.TriggerSource.EMAIL_CONSUME,
+            PaperlessTask.TriggerSource.FOLDER_CONSUME,
+        ],
+        "scheduled_task": [PaperlessTask.TriggerSource.SCHEDULED],
+        "manual_task": [
+            PaperlessTask.TriggerSource.MANUAL,
+            PaperlessTask.TriggerSource.WEB_UI,
+            PaperlessTask.TriggerSource.API_UPLOAD,
+        ],
+    }
+
+    _RUNNABLE_TASKS = {
+        PaperlessTask.TaskType.TRAIN_CLASSIFIER: (train_classifier, {}),
+        PaperlessTask.TaskType.SANITY_CHECK: (sanity_check, {"raise_on_error": False}),
+        PaperlessTask.TaskType.LLM_INDEX: (llmindex_index, {"rebuild": False}),
+    }
+
+    def get_serializer_class(self):
+        # v9: use backwards-compatible serializer with old field names
+        if self.request.version and int(self.request.version) < 10:
+            return TaskSerializerV9
+        return TaskSerializerV10
+
+    def paginate_queryset(self, queryset):
+        # v9: tasks endpoint was not paginated; preserve plain-list response
+        if self.request.version and int(self.request.version) < 10:
+            return None
+        return super().paginate_queryset(queryset)
+
     def get_queryset(self):
-        queryset = PaperlessTask.objects.all().order_by("-date_created")
+        is_v9 = self.request.version and int(self.request.version) < 10
+        if self.request.user.is_staff:
+            queryset = PaperlessTask.objects.all()
+        else:
+            # Own tasks + unowned (system/scheduled) tasks. Tasks owned by other
+            # users are never visible to non-staff regardless of API version.
+            queryset = PaperlessTask.objects.filter(
+                Q(owner=self.request.user) | Q(owner__isnull=True),
+            )
+        # v9 backwards compat: map old query params to new field names
+        if is_v9:
+            task_name = self.request.query_params.get("task_name")
+            if task_name is not None:
+                mapped = self._V9_TASK_NAME_TO_TYPE.get(task_name, task_name)
+                queryset = queryset.filter(task_type=mapped)
+            task_type_old = self.request.query_params.get("type")
+            if task_type_old is not None:
+                sources = self._V9_TYPE_TO_TRIGGER_SOURCES.get(task_type_old)
+                if sources:
+                    queryset = queryset.filter(trigger_source__in=sources)
+        # v10+: direct task_id param for backwards compat
         task_id = self.request.query_params.get("task_id")
         if task_id is not None:
-            queryset = PaperlessTask.objects.filter(task_id=task_id)
+            queryset = queryset.filter(task_id=task_id)
         return queryset
 
     @action(
@@ -3837,33 +4389,96 @@ class TasksViewSet(ReadOnlyModelViewSet[PaperlessTask]):
         serializer = AcknowledgeTasksViewSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         task_ids = serializer.validated_data.get("tasks")
+        tasks = self.get_queryset().filter(id__in=task_ids)
+        count = tasks.update(acknowledged=True)
+        return Response({"result": count})
 
+    def get_permissions(self):
+        if self.action == "summary" and has_system_status_permission(
+            getattr(self.request, "user", None),
+        ):
+            return [IsAuthenticated()]
+        return super().get_permissions()
+
+    @action(methods=["get"], detail=False)
+    def summary(self, request):
+        """Aggregated task statistics per task_type over the last N days (default 30)."""
         try:
-            tasks = PaperlessTask.objects.filter(id__in=task_ids)
-            if request.user is not None and not request.user.is_superuser:
-                tasks = tasks.filter(owner=request.user) | tasks.filter(owner=None)
-            result = tasks.update(
-                acknowledged=True,
+            days = min(365, max(1, int(request.query_params.get("days", 30))))
+        except (TypeError, ValueError):
+            return Response(
+                {"days": "Must be a positive integer."},
+                status=status.HTTP_400_BAD_REQUEST,
             )
-            return Response({"result": result})
-        except Exception:
-            return HttpResponseBadRequest()
+        cutoff = timezone.now() - timedelta(days=days)
+        if has_system_status_permission(request.user):
+            queryset = PaperlessTask.objects.filter(date_created__gte=cutoff)
+        else:
+            queryset = self.get_queryset().filter(date_created__gte=cutoff)
+
+        data = queryset.values("task_type").annotate(
+            total_count=Count("id"),
+            pending_count=Count("id", filter=Q(status=PaperlessTask.Status.PENDING)),
+            success_count=Count("id", filter=Q(status=PaperlessTask.Status.SUCCESS)),
+            failure_count=Count("id", filter=Q(status=PaperlessTask.Status.FAILURE)),
+            avg_duration_seconds=Avg(
+                "duration_seconds",
+                filter=Q(duration_seconds__isnull=False),
+            ),
+            avg_wait_time_seconds=Avg(
+                "wait_time_seconds",
+                filter=Q(wait_time_seconds__isnull=False),
+            ),
+            last_run=Max("date_created"),
+            last_success=Max(
+                "date_done",
+                filter=Q(status=PaperlessTask.Status.SUCCESS),
+            ),
+            last_failure=Max(
+                "date_done",
+                filter=Q(status=PaperlessTask.Status.FAILURE),
+            ),
+        )
+        serializer = TaskSummarySerializer(data, many=True)
+        return Response(serializer.data)
+
+    @action(methods=["get"], detail=False)
+    def active(self, request):
+        """Currently pending and running tasks (capped at 50)."""
+        queryset = (
+            self.get_queryset()
+            .filter(
+                status__in=[PaperlessTask.Status.PENDING, PaperlessTask.Status.STARTED],
+            )
+            .order_by("-date_created")[:50]
+        )
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
 
     @action(methods=["post"], detail=False)
     def run(self, request):
-        serializer = RunTaskViewSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        task_name = serializer.validated_data.get("task_name")
-
+        """Manually dispatch a background task. Superuser only."""
         if not request.user.is_superuser:
             return HttpResponseForbidden("Insufficient permissions")
+        serializer = RunTaskSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        task_type = serializer.validated_data.get("task_type")
+
+        if task_type not in self._RUNNABLE_TASKS:
+            return Response(
+                {"error": f"Task type '{task_type}' cannot be manually triggered"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         try:
-            task_func, task_args = self.TASK_AND_ARGS_BY_NAME[task_name]
-            result = task_func(**task_args)
-            return Response({"result": result})
+            task_func, task_kwargs = self._RUNNABLE_TASKS[task_type]
+            async_result = task_func.apply_async(
+                kwargs=task_kwargs,
+                headers={"trigger_source": PaperlessTask.TriggerSource.MANUAL},
+            )
+            return Response({"task_id": async_result.id})
         except Exception as e:
-            logger.warning(f"An error occurred running task: {e!s}")
+            logger.warning(f"Error running task: {e!s}")
             return HttpResponseServerError(
                 "Error running task, check logs for more detail.",
             )
@@ -3893,6 +4508,19 @@ class ShareLinkViewSet(
     ordering_fields = ("created", "expiration", "document")
 
 
+@extend_schema_view(
+    rebuild=extend_schema(
+        operation_id="share_link_bundles_rebuild",
+        description="Reset and re-queue a share link bundle for processing.",
+        responses={
+            HTTPStatus.OK: ShareLinkBundleSerializer,
+            (HTTPStatus.BAD_REQUEST, "application/json"): inline_serializer(
+                name="RebuildBundleError",
+                fields={"detail": serializers.CharField()},
+            ),
+        },
+    ),
+)
 class ShareLinkBundleViewSet(PassUserMixin, ModelViewSet[ShareLinkBundle]):
     model = ShareLinkBundle
 
@@ -3970,7 +4598,10 @@ class ShareLinkBundleViewSet(PassUserMixin, ModelViewSet[ShareLinkBundle]):
                 "file_path",
             ],
         )
-        build_share_link_bundle.delay(bundle.pk)
+        build_share_link_bundle.apply_async(
+            kwargs={"bundle_id": bundle.pk},
+            headers={"trigger_source": PaperlessTask.TriggerSource.MANUAL},
+        )
         bundle.document_total = len(ordered_documents)
         response_serializer = self.get_serializer(bundle)
         headers = self.get_success_headers(response_serializer.data)
@@ -4003,7 +4634,10 @@ class ShareLinkBundleViewSet(PassUserMixin, ModelViewSet[ShareLinkBundle]):
                 "file_path",
             ],
         )
-        build_share_link_bundle.delay(bundle.pk)
+        build_share_link_bundle.apply_async(
+            kwargs={"bundle_id": bundle.pk},
+            headers={"trigger_source": PaperlessTask.TriggerSource.MANUAL},
+        )
         bundle.document_total = (
             getattr(bundle, "document_total", None) or bundle.documents.count()
         )
@@ -4082,7 +4716,7 @@ def serve_file(
     use_archive: bool,
     disposition: str,
     follow_formatting: bool = False,
-) -> HttpResponse:
+) -> FileResponse:
     if use_archive:
         if TYPE_CHECKING:
             assert doc.archive_filename
@@ -4105,7 +4739,7 @@ def serve_file(
         if mime_type in {"application/csv", "text/csv"} and disposition == "inline":
             mime_type = "text/plain"
 
-    response = HttpResponse(file_handle, content_type=mime_type)
+    response = FileResponse(file_handle, content_type=mime_type)
     # Firefox is not able to handle unicode characters in filename field
     # RFC 5987 addresses this issue
     # see https://datatracker.ietf.org/doc/html/rfc5987#section-4.2
@@ -4305,8 +4939,44 @@ class WorkflowViewSet(ModelViewSet[Workflow]):
         Workflow.objects.all()
         .order_by("order")
         .prefetch_related(
-            "triggers",
-            "actions",
+            Prefetch(
+                "triggers",
+                queryset=WorkflowTrigger.objects.prefetch_related(
+                    "filter_has_tags",
+                    "filter_has_all_tags",
+                    "filter_has_not_tags",
+                    "filter_has_any_correspondents",
+                    "filter_has_not_correspondents",
+                    "filter_has_any_document_types",
+                    "filter_has_not_document_types",
+                    "filter_has_any_storage_paths",
+                    "filter_has_not_storage_paths",
+                ),
+            ),
+            Prefetch(
+                "actions",
+                queryset=WorkflowAction.objects.order_by(
+                    "order",
+                    "pk",
+                ).prefetch_related(
+                    "assign_tags",
+                    "assign_view_users",
+                    "assign_view_groups",
+                    "assign_change_users",
+                    "assign_change_groups",
+                    "assign_custom_fields",
+                    "remove_tags",
+                    "remove_correspondents",
+                    "remove_document_types",
+                    "remove_storage_paths",
+                    "remove_custom_fields",
+                    "remove_owners",
+                    "remove_view_users",
+                    "remove_view_groups",
+                    "remove_change_users",
+                    "remove_change_groups",
+                ),
+            ),
         )
     )
 
@@ -4371,6 +5041,16 @@ class CustomFieldViewSet(PermissionsAwareDocumentCountMixin, ModelViewSet[Custom
                             "redis_status": serializers.CharField(),
                             "redis_error": serializers.CharField(),
                             "celery_status": serializers.CharField(),
+                            "summary": inline_serializer(
+                                name="TasksSummaryOverview",
+                                fields={
+                                    "days": serializers.IntegerField(),
+                                    "total_count": serializers.IntegerField(),
+                                    "pending_count": serializers.IntegerField(),
+                                    "success_count": serializers.IntegerField(),
+                                    "failure_count": serializers.IntegerField(),
+                                },
+                            ),
                         },
                     ),
                     "index": inline_serializer(
@@ -4404,6 +5084,7 @@ class CustomFieldViewSet(PermissionsAwareDocumentCountMixin, ModelViewSet[Custom
 )
 class SystemStatusView(PassUserMixin):
     permission_classes = (IsAuthenticated,)
+    TASK_SUMMARY_DAYS = 30
 
     def get(self, request, format=None):
         if not has_system_status_permission(request.user):
@@ -4495,12 +5176,8 @@ class SystemStatusView(PassUserMixin):
 
         last_trained_task = (
             PaperlessTask.objects.filter(
-                task_name=PaperlessTask.TaskName.TRAIN_CLASSIFIER,
-                status__in=[
-                    states.SUCCESS,
-                    states.FAILURE,
-                    states.REVOKED,
-                ],  # ignore running tasks
+                task_type=PaperlessTask.TaskType.TRAIN_CLASSIFIER,
+                status__in=PaperlessTask.COMPLETE_STATUSES,  # ignore running tasks
             )
             .order_by("-date_done")
             .first()
@@ -4510,21 +5187,21 @@ class SystemStatusView(PassUserMixin):
         if last_trained_task is None:
             classifier_status = "WARNING"
             classifier_error = "No classifier training tasks found"
-        elif last_trained_task and last_trained_task.status != states.SUCCESS:
+        elif last_trained_task.status != PaperlessTask.Status.SUCCESS:
             classifier_status = "ERROR"
-            classifier_error = last_trained_task.result
+            classifier_error = (
+                last_trained_task.result_data.get("error_message")
+                if last_trained_task.result_data
+                else None
+            )
         classifier_last_trained = (
             last_trained_task.date_done if last_trained_task else None
         )
 
         last_sanity_check = (
             PaperlessTask.objects.filter(
-                task_name=PaperlessTask.TaskName.CHECK_SANITY,
-                status__in=[
-                    states.SUCCESS,
-                    states.FAILURE,
-                    states.REVOKED,
-                ],  # ignore running tasks
+                task_type=PaperlessTask.TaskType.SANITY_CHECK,
+                status__in=PaperlessTask.COMPLETE_STATUSES,  # ignore running tasks
             )
             .order_by("-date_done")
             .first()
@@ -4534,9 +5211,13 @@ class SystemStatusView(PassUserMixin):
         if last_sanity_check is None:
             sanity_check_status = "WARNING"
             sanity_check_error = "No sanity check tasks found"
-        elif last_sanity_check and last_sanity_check.status != states.SUCCESS:
+        elif last_sanity_check.status != PaperlessTask.Status.SUCCESS:
             sanity_check_status = "ERROR"
-            sanity_check_error = last_sanity_check.result
+            sanity_check_error = (
+                last_sanity_check.result_data.get("error_message")
+                if last_sanity_check.result_data
+                else None
+            )
         sanity_check_last_run = (
             last_sanity_check.date_done if last_sanity_check else None
         )
@@ -4549,7 +5230,7 @@ class SystemStatusView(PassUserMixin):
         else:
             last_llmindex_update = (
                 PaperlessTask.objects.filter(
-                    task_name=PaperlessTask.TaskName.LLMINDEX_UPDATE,
+                    task_type=PaperlessTask.TaskType.LLM_INDEX,
                 )
                 .order_by("-date_done")
                 .first()
@@ -4559,12 +5240,39 @@ class SystemStatusView(PassUserMixin):
             if last_llmindex_update is None:
                 llmindex_status = "WARNING"
                 llmindex_error = "No LLM index update tasks found"
-            elif last_llmindex_update and last_llmindex_update.status == states.FAILURE:
+            elif last_llmindex_update.status == PaperlessTask.Status.FAILURE:
                 llmindex_status = "ERROR"
-                llmindex_error = last_llmindex_update.result
+                llmindex_error = (
+                    last_llmindex_update.result_data.get("error_message")
+                    if last_llmindex_update.result_data
+                    else None
+                )
             llmindex_last_modified = (
                 last_llmindex_update.date_done if last_llmindex_update else None
             )
+
+        summary_cutoff = timezone.now() - timedelta(days=self.TASK_SUMMARY_DAYS)
+        task_summary_agg = PaperlessTask.objects.filter(
+            date_created__gte=summary_cutoff,
+        ).aggregate(
+            total_count=Count("id"),
+            pending_count=Count(
+                "id",
+                filter=Q(status=PaperlessTask.Status.PENDING),
+            ),
+            success_count=Count(
+                "id",
+                filter=Q(status=PaperlessTask.Status.SUCCESS),
+            ),
+            failure_count=Count(
+                "id",
+                filter=Q(status=PaperlessTask.Status.FAILURE),
+            ),
+        )
+        task_summary = {
+            "days": self.TASK_SUMMARY_DAYS,
+            **task_summary_agg,
+        }
 
         return Response(
             {
@@ -4606,6 +5314,7 @@ class SystemStatusView(PassUserMixin):
                     "llmindex_status": llmindex_status,
                     "llmindex_last_modified": llmindex_last_modified,
                     "llmindex_error": llmindex_error,
+                    "summary": task_summary,
                 },
             },
         )

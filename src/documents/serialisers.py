@@ -12,7 +12,6 @@ from typing import Literal
 from typing import TypedDict
 
 import magic
-from celery import states
 from django.conf import settings
 from django.contrib.auth.models import Group
 from django.contrib.auth.models import User
@@ -40,6 +39,7 @@ from drf_spectacular.utils import extend_schema_field
 from drf_spectacular.utils import extend_schema_serializer
 from drf_writable_nested.serializers import NestedUpdateMixin
 from guardian.core import ObjectPermissionChecker
+from guardian.shortcuts import get_objects_for_user
 from guardian.shortcuts import get_users_with_perms
 from guardian.utils import get_group_obj_perms_model
 from guardian.utils import get_user_obj_perms_model
@@ -216,7 +216,7 @@ class SetPermissionsMixin:
         set_permissions_for_object(permissions, object)
 
 
-class SerializerWithPerms(serializers.Serializer):
+class SerializerWithPerms(serializers.Serializer[dict[str, Any]]):
     def __init__(self, *args, **kwargs) -> None:
         self.user = kwargs.pop("user", None)
         self.full_perms = kwargs.pop("full_perms", False)
@@ -963,18 +963,10 @@ def _get_viewable_duplicates(
     return duplicates.filter(id__in=allowed)
 
 
-class DuplicateDocumentSummarySerializer(serializers.Serializer):
+class DuplicateDocumentSummarySerializer(serializers.Serializer[dict[str, Any]]):
     id = serializers.IntegerField()
     title = serializers.CharField()
     deleted_at = serializers.DateTimeField(allow_null=True)
-
-
-class DocumentVersionInfoSerializer(serializers.Serializer):
-    id = serializers.IntegerField()
-    added = serializers.DateTimeField()
-    version_label = serializers.CharField(required=False, allow_null=True)
-    checksum = serializers.CharField(required=False, allow_null=True)
-    is_root = serializers.BooleanField()
 
 
 class _DocumentVersionInfo(TypedDict):
@@ -983,6 +975,14 @@ class _DocumentVersionInfo(TypedDict):
     version_label: str | None
     checksum: str | None
     is_root: bool
+
+
+class DocumentVersionInfoSerializer(serializers.Serializer[_DocumentVersionInfo]):
+    id = serializers.IntegerField()
+    added = serializers.DateTimeField()
+    version_label = serializers.CharField(required=False, allow_null=True)
+    checksum = serializers.CharField(required=False, allow_null=True)
+    is_root = serializers.BooleanField()
 
 
 @extend_schema_serializer(
@@ -1543,7 +1543,7 @@ class SavedViewSerializer(OwnedObjectSerializer):
         return saved_view
 
 
-class DocumentListSerializer(serializers.Serializer):
+class DocumentListSerializer(serializers.Serializer[dict[str, list[int]]]):
     documents = serializers.ListField(
         required=True,
         label="Documents",
@@ -1615,6 +1615,7 @@ class RotateDocumentsSerializer(DocumentSelectionSerializer, SourceModeValidatio
         required=False,
         default=bulk_edit.SourceModeChoices.LATEST_VERSION,
     )
+    from_webui = serializers.BooleanField(required=False, default=False)
 
 
 class MergeDocumentsSerializer(DocumentListSerializer, SourceModeValidationMixin):
@@ -1628,6 +1629,7 @@ class MergeDocumentsSerializer(DocumentListSerializer, SourceModeValidationMixin
         required=False,
         default=bulk_edit.SourceModeChoices.LATEST_VERSION,
     )
+    from_webui = serializers.BooleanField(required=False, default=False)
 
 
 class EditPdfDocumentsSerializer(DocumentListSerializer, SourceModeValidationMixin):
@@ -1639,6 +1641,7 @@ class EditPdfDocumentsSerializer(DocumentListSerializer, SourceModeValidationMix
         required=False,
         default=bulk_edit.SourceModeChoices.LATEST_VERSION,
     )
+    from_webui = serializers.BooleanField(required=False, default=False)
 
     def validate(self, attrs):
         documents = attrs["documents"]
@@ -1690,6 +1693,7 @@ class RemovePasswordDocumentsSerializer(
         required=False,
         default=bulk_edit.SourceModeChoices.LATEST_VERSION,
     )
+    from_webui = serializers.BooleanField(required=False, default=False)
 
 
 class DeleteDocumentsSerializer(DocumentSelectionSerializer):
@@ -1737,6 +1741,7 @@ class BulkEditSerializer(
     )
 
     parameters = serializers.DictField(allow_empty=True, default={}, write_only=True)
+    from_webui = serializers.BooleanField(required=False, default=False)
 
     def _validate_tag_id_list(self, tags, name="tags") -> None:
         if not isinstance(tags, list):
@@ -2091,7 +2096,7 @@ class BulkEditSerializer(
         return attrs
 
 
-class PostDocumentSerializer(serializers.Serializer):
+class PostDocumentSerializer(serializers.Serializer[dict[str, Any]]):
     created = serializers.DateTimeField(
         label="Created",
         allow_null=True,
@@ -2268,7 +2273,7 @@ class PostDocumentSerializer(serializers.Serializer):
             return created.date()
 
 
-class DocumentVersionSerializer(serializers.Serializer):
+class DocumentVersionSerializer(serializers.Serializer[dict[str, Any]]):
     document = serializers.FileField(
         label="Document",
         write_only=True,
@@ -2284,7 +2289,7 @@ class DocumentVersionSerializer(serializers.Serializer):
     validate_document = PostDocumentSerializer().validate_document
 
 
-class DocumentVersionLabelSerializer(serializers.Serializer):
+class DocumentVersionLabelSerializer(serializers.Serializer[dict[str, str | None]]):
     version_label = serializers.CharField(
         label="Version label",
         required=True,
@@ -2409,7 +2414,10 @@ class StoragePathSerializer(MatchingModelSerializer, OwnedObjectSerializer):
         """
         doc_ids = [doc.id for doc in instance.documents.all()]
         if doc_ids:
-            bulk_edit.bulk_update_documents.delay(doc_ids)
+            bulk_edit.bulk_update_documents.apply_async(
+                kwargs={"document_ids": doc_ids},
+                headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
+            )
 
         return super().update(instance, validated_data)
 
@@ -2442,7 +2450,79 @@ class UiSettingsViewSerializer(serializers.ModelSerializer[UiSettings]):
         return ui_settings
 
 
-class TasksViewSerializer(OwnedObjectSerializer):
+class TaskSerializerV10(OwnedObjectSerializer):
+    """Task serializer for API v10+ using new field names."""
+
+    related_document_ids = serializers.ListField(
+        child=serializers.IntegerField(),
+        read_only=True,
+    )
+    task_type_display = serializers.CharField(
+        source="get_task_type_display",
+        read_only=True,
+    )
+    trigger_source_display = serializers.CharField(
+        source="get_trigger_source_display",
+        read_only=True,
+    )
+    status_display = serializers.CharField(
+        source="get_status_display",
+        read_only=True,
+    )
+
+    class Meta:
+        model = PaperlessTask
+        fields = (
+            "id",
+            "task_id",
+            "task_type",
+            "task_type_display",
+            "trigger_source",
+            "trigger_source_display",
+            "status",
+            "status_display",
+            "date_created",
+            "date_started",
+            "date_done",
+            "duration_seconds",
+            "wait_time_seconds",
+            "input_data",
+            "result_data",
+            "related_document_ids",
+            "acknowledged",
+            "owner",
+        )
+        read_only_fields = fields
+
+
+class TaskSerializerV9(serializers.ModelSerializer[PaperlessTask]):
+    """Task serializer for API v9 backwards compatibility.
+
+    Maps old field names to the new model fields so existing clients continue
+    to work unchanged.
+    """
+
+    # v9 field: task_name -> task_type (with value remapping for renamed tasks)
+    task_name = serializers.SerializerMethodField()
+
+    # v9 field: task_file_name -> input_data.filename
+    task_file_name = serializers.SerializerMethodField()
+
+    # v9 field: type -> trigger_source (mapped to old enum labels)
+    type = serializers.SerializerMethodField()
+
+    # v9 field: status -> uppercase Celery state strings
+    status = serializers.SerializerMethodField()
+
+    # v9 field: result -> derived from result_data
+    result = serializers.SerializerMethodField()
+
+    # v9 field: related_document -> first document ID from result_data
+    related_document = serializers.SerializerMethodField()
+
+    # v9 field: duplicate_documents -> list of duplicate IDs from result_data
+    duplicate_documents = serializers.SerializerMethodField()
+
     class Meta:
         model = PaperlessTask
         fields = (
@@ -2450,59 +2530,113 @@ class TasksViewSerializer(OwnedObjectSerializer):
             "task_id",
             "task_name",
             "task_file_name",
-            "date_created",
-            "date_done",
             "type",
             "status",
+            "date_created",
+            "date_done",
             "result",
             "acknowledged",
             "related_document",
             "duplicate_documents",
             "owner",
         )
+        read_only_fields = fields
 
-    related_document = serializers.SerializerMethodField()
-    duplicate_documents = serializers.SerializerMethodField()
-    created_doc_re = re.compile(r"New document id (\d+) created")
-    duplicate_doc_re = re.compile(r"It is a duplicate of .* \(#(\d+)\)")
+    _TASK_TYPE_TO_V9_NAME = {
+        PaperlessTask.TaskType.SANITY_CHECK: "check_sanity",
+        PaperlessTask.TaskType.LLM_INDEX: "llmindex_update",
+    }
 
-    def get_related_document(self, obj) -> str | None:
-        result = None
-        re = None
-        if obj.result:
-            match obj.status:
-                case states.SUCCESS:
-                    re = self.created_doc_re
-                case states.FAILURE:
-                    re = (
-                        self.duplicate_doc_re
-                        if "existing document is in the trash" not in obj.result
-                        else None
-                    )
-            if re is not None:
-                try:
-                    result = re.search(obj.result).group(1)
-                except Exception:
-                    pass
+    def get_result(self, obj: PaperlessTask) -> str | None:
+        """Reconstruct a human-readable result string from result_data for v9 clients."""
+        if not obj.result_data:
+            return None
+        if doc_id := obj.result_data.get("document_id"):
+            return f"Success. New document id {doc_id} created"
+        if reason := obj.result_data.get("reason"):
+            return reason
+        if dup_id := obj.result_data.get("duplicate_of"):
+            return f"Not consuming: It is a duplicate of document #{dup_id}"
+        if error := obj.result_data.get("error_message"):
+            return error
+        return None
 
-        return result
+    def get_task_name(self, obj: PaperlessTask) -> str:
+        return self._TASK_TYPE_TO_V9_NAME.get(obj.task_type, obj.task_type)
 
-    @extend_schema_field(DuplicateDocumentSummarySerializer(many=True))
-    def get_duplicate_documents(self, obj):
-        related_document = self.get_related_document(obj)
-        request = self.context.get("request")
-        user = request.user if request else None
-        document = Document.global_objects.filter(pk=related_document).first()
-        if not related_document or not user or not document:
+    def get_task_file_name(self, obj: PaperlessTask) -> str | None:
+        if not obj.input_data:
+            return None
+        return obj.input_data.get("filename")
+
+    _STATUS_TO_V9 = {
+        PaperlessTask.Status.PENDING: "PENDING",
+        PaperlessTask.Status.STARTED: "STARTED",
+        PaperlessTask.Status.SUCCESS: "SUCCESS",
+        PaperlessTask.Status.FAILURE: "FAILURE",
+        PaperlessTask.Status.REVOKED: "REVOKED",
+    }
+
+    def get_status(self, obj: PaperlessTask) -> str:
+        return self._STATUS_TO_V9.get(obj.status, obj.status.upper())
+
+    _TRIGGER_SOURCE_TO_V9_TYPE = {
+        PaperlessTask.TriggerSource.SCHEDULED: "scheduled_task",
+        PaperlessTask.TriggerSource.SYSTEM: "auto_task",
+        # Email and folder-consumer documents are system-initiated, not manually triggered
+        PaperlessTask.TriggerSource.EMAIL_CONSUME: "auto_task",
+        PaperlessTask.TriggerSource.FOLDER_CONSUME: "auto_task",
+    }
+
+    def get_type(self, obj: PaperlessTask) -> str:
+        return self._TRIGGER_SOURCE_TO_V9_TYPE.get(obj.trigger_source, "manual_task")
+
+    def get_related_document(self, obj: PaperlessTask) -> int | None:
+        ids = obj.related_document_ids
+        return ids[0] if ids else None
+
+    def get_duplicate_documents(
+        self,
+        obj: PaperlessTask,
+    ) -> list[dict[str, Any]]:
+        if not obj.result_data:
             return []
-        duplicates = _get_viewable_duplicates(document, user)
-        return list(duplicates.values("id", "title", "deleted_at"))
+        dup_of = obj.result_data.get("duplicate_of")
+        if dup_of is None:
+            return []
+        request = self.context.get("request")
+        if request is None:
+            return []
+        user = request.user
+        qs = Document.global_objects.filter(pk=dup_of)
+        if not user.is_staff:
+            with_perms = get_objects_for_user(
+                user,
+                "documents.view_document",
+                qs,
+                accept_global_perms=False,
+            )
+            qs = with_perms | qs.filter(owner=user) | qs.filter(owner__isnull=True)
+        return list(qs.values("id", "title", "deleted_at"))
 
 
-class RunTaskViewSerializer(serializers.Serializer[dict[str, Any]]):
-    task_name = serializers.ChoiceField(
-        choices=PaperlessTask.TaskName.choices,
-        label="Task Name",
+class TaskSummarySerializer(serializers.Serializer[dict[str, Any]]):
+    task_type = serializers.CharField()
+    total_count = serializers.IntegerField()
+    pending_count = serializers.IntegerField()
+    success_count = serializers.IntegerField()
+    failure_count = serializers.IntegerField()
+    avg_duration_seconds = serializers.FloatField(allow_null=True)
+    avg_wait_time_seconds = serializers.FloatField(allow_null=True)
+    last_run = serializers.DateTimeField(allow_null=True)
+    last_success = serializers.DateTimeField(allow_null=True)
+    last_failure = serializers.DateTimeField(allow_null=True)
+
+
+class RunTaskSerializer(serializers.Serializer[dict[str, str]]):
+    task_type = serializers.ChoiceField(
+        choices=PaperlessTask.TaskType.choices,
+        label="Task Type",
         write_only=True,
     )
 
@@ -3229,13 +3363,13 @@ class WorkflowSerializer(serializers.ModelSerializer[Workflow]):
         ManyToMany fields dont support e.g. on_delete so we need to discard unattached
         triggers and actions manually
         """
-        for trigger in WorkflowTrigger.objects.all():
-            if trigger.workflows.all().count() == 0:
-                trigger.delete()
+        WorkflowTrigger.objects.annotate(
+            workflow_count=Count("workflows"),
+        ).filter(workflow_count=0).delete()
 
-        for action in WorkflowAction.objects.all():
-            if action.workflows.all().count() == 0:
-                action.delete()
+        WorkflowAction.objects.annotate(
+            workflow_count=Count("workflows"),
+        ).filter(workflow_count=0).delete()
 
         WorkflowActionEmail.objects.filter(action=None).delete()
         WorkflowActionWebhook.objects.filter(action=None).delete()
@@ -3263,16 +3397,6 @@ class WorkflowSerializer(serializers.ModelSerializer[Workflow]):
         self.prune_triggers_and_actions()
 
         return instance
-
-    def to_representation(self, instance: Workflow) -> dict[str, Any]:
-        data = super().to_representation(instance)
-        actions = instance.actions.order_by("order", "pk")
-        data["actions"] = WorkflowActionSerializer(
-            actions,
-            many=True,
-            context=self.context,
-        ).data
-        return data
 
 
 class TrashSerializer(SerializerWithPerms):

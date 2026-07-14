@@ -3,6 +3,7 @@ from datetime import timedelta
 from unittest import mock
 
 import pytest
+import time_machine
 from dateutil.relativedelta import relativedelta
 from django.contrib.auth.models import Group
 from django.contrib.auth.models import Permission
@@ -26,6 +27,7 @@ from documents.models import Tag
 from documents.models import Workflow
 from documents.search import get_backend
 from documents.search import reset_backend
+from documents.tests.factories import DocumentFactory
 from documents.tests.utils import DirectoriesMixin
 from paperless_mail.models import MailAccount
 from paperless_mail.models import MailRule
@@ -741,6 +743,49 @@ class TestDocumentSearchApi(DirectoriesMixin, APITestCase):
         # Tantivy rejects unparsable field queries with a 400
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
+    @override_settings(
+        TIME_ZONE="UTC",
+    )
+    @time_machine.travel(
+        datetime.datetime(2026, 7, 15, 12, 0, tzinfo=datetime.UTC),
+        tick=False,
+    )
+    def test_search_added_previous_quarter(self) -> None:
+        """
+        GIVEN:
+            - Documents inside and outside the previous quarter
+        WHEN:
+            - Query with the legacy natural-language phrase used by the UI
+        THEN:
+            - Previous-quarter documents are returned
+        """
+        d1 = DocumentFactory.create(
+            title="quarterly statement april",
+            content="bank statement",
+            added=datetime.datetime(2026, 4, 10, 12, 0, tzinfo=datetime.UTC),
+        )
+        d2 = DocumentFactory.create(
+            title="quarterly statement june",
+            content="bank statement",
+            added=datetime.datetime(2026, 6, 20, 12, 0, tzinfo=datetime.UTC),
+        )
+        d3 = DocumentFactory.create(
+            title="quarterly statement july",
+            content="bank statement",
+            added=datetime.datetime(2026, 7, 10, 12, 0, tzinfo=datetime.UTC),
+        )
+
+        backend = get_backend()
+        backend.add_or_update(d1)
+        backend.add_or_update(d2)
+        backend.add_or_update(d3)
+
+        response = self.client.get('/api/documents/?query=added:"previous quarter"')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        results = response.data["results"]
+        self.assertEqual({r["id"] for r in results}, {1, 2})
+
     @mock.patch("documents.search._backend.TantivyBackend.autocomplete")
     def test_search_autocomplete_limits(self, m) -> None:
         """
@@ -898,7 +943,7 @@ class TestDocumentSearchApi(DirectoriesMixin, APITestCase):
         response = self.client.get("/api/documents/?query=things")
         self.assertIsNone(response.data["corrected_query"])
 
-    def test_search_spelling_suggestion_suppressed_for_private_terms(self):
+    def test_search_spelling_suggestion_suppressed_for_private_terms(self) -> None:
         owner = User.objects.create_user("owner")
         attacker = User.objects.create_user("attacker")
         attacker.user_permissions.add(
@@ -942,29 +987,32 @@ class TestDocumentSearchApi(DirectoriesMixin, APITestCase):
         THEN:
             - The similar documents are returned from the API request
         """
-        d1 = Document.objects.create(
+        # Distinct created/added dates: documents created at the same instant
+        # share a timestamp term, and more_like_this (which cannot be scoped to
+        # content fields) would then match on it, surfacing unrelated documents.
+        d1 = DocumentFactory(
             title="invoice",
             content="the thing i bought at a shop and paid with bank account",
-            checksum="A",
-            pk=1,
+            created=datetime.date(2018, 1, 1),
+            added=timezone.make_aware(datetime.datetime(2018, 1, 1)),
         )
-        d2 = Document.objects.create(
+        d2 = DocumentFactory(
             title="bank statement 1",
             content="things i paid for in august",
-            pk=2,
-            checksum="B",
+            created=datetime.date(2019, 3, 4),
+            added=timezone.make_aware(datetime.datetime(2019, 3, 4)),
         )
-        d3 = Document.objects.create(
+        d3 = DocumentFactory(
             title="bank statement 3",
             content="things i paid for in september",
-            pk=3,
-            checksum="C",
+            created=datetime.date(2020, 7, 9),
+            added=timezone.make_aware(datetime.datetime(2020, 7, 9)),
         )
-        d4 = Document.objects.create(
+        d4 = DocumentFactory(
             title="Quarterly Report",
             content="quarterly revenue profit margin earnings growth",
-            pk=4,
-            checksum="ABC",
+            created=datetime.date(2021, 11, 30),
+            added=timezone.make_aware(datetime.datetime(2021, 11, 30)),
         )
         backend = get_backend()
         backend.add_or_update(d1)
@@ -982,6 +1030,19 @@ class TestDocumentSearchApi(DirectoriesMixin, APITestCase):
         result_ids = [r["id"] for r in results]
         self.assertIn(d3.id, result_ids)
         self.assertNotIn(d4.id, result_ids)
+
+    def test_more_like_requires_id_of_existing_document(self) -> None:
+        """
+        GIVEN:
+            - No document with the given ID exists
+        WHEN:
+            - API request for more like a given document is made with a non-existent document ID
+        THEN:
+            - 403 Forbidden is returned with an appropriate error message
+        """
+        response = self.client.get("/api/documents/?more_like_id=9999")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(response.content, b"Invalid more_like_id")
 
     def test_search_more_like_requires_view_permission_on_seed_document(
         self,
@@ -1502,6 +1563,126 @@ class TestDocumentSearchApi(DirectoriesMixin, APITestCase):
             search_query("&ordering=-owner"),
             [d2.id, d1.id, d3.id],
         )
+
+    def test_search_ordering_by_score(self) -> None:
+        """ordering=-score must return results in descending relevance order (best first)."""
+        backend = get_backend()
+        # doc_high has more occurrences of the search term → higher BM25 score
+        doc_low = Document.objects.create(
+            title="score sort low",
+            content="apple",
+            checksum="SCL1",
+        )
+        doc_high = Document.objects.create(
+            title="score sort high",
+            content="apple apple apple apple apple",
+            checksum="SCH1",
+        )
+        backend.add_or_update(doc_low)
+        backend.add_or_update(doc_high)
+
+        # -score = descending = best first (highest score)
+        response = self.client.get("/api/documents/?query=apple&ordering=-score")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        ids = [r["id"] for r in response.data["results"]]
+        self.assertEqual(
+            ids[0],
+            doc_high.id,
+            "Most relevant doc should be first for -score",
+        )
+
+        # score = ascending = worst first (lowest score)
+        response = self.client.get("/api/documents/?query=apple&ordering=score")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        ids = [r["id"] for r in response.data["results"]]
+        self.assertEqual(
+            ids[0],
+            doc_low.id,
+            "Least relevant doc should be first for +score",
+        )
+
+    def test_search_with_tantivy_native_sort(self) -> None:
+        """When ordering by a Tantivy-sortable field, results must be correctly sorted."""
+        backend = get_backend()
+        for i, asn in enumerate([30, 10, 20]):
+            doc = Document.objects.create(
+                title=f"sortable doc {i}",
+                content="searchable content",
+                checksum=f"TNS{i}",
+                archive_serial_number=asn,
+            )
+            backend.add_or_update(doc)
+
+        response = self.client.get(
+            "/api/documents/?query=searchable&ordering=archive_serial_number",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        asns = [doc["archive_serial_number"] for doc in response.data["results"]]
+        self.assertEqual(asns, [10, 20, 30])
+
+        response = self.client.get(
+            "/api/documents/?query=searchable&ordering=-archive_serial_number",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        asns = [doc["archive_serial_number"] for doc in response.data["results"]]
+        self.assertEqual(asns, [30, 20, 10])
+
+    def test_search_page_2_returns_correct_slice(self) -> None:
+        """Page 2 must return the second slice, not overlap with page 1."""
+        backend = get_backend()
+        for i in range(10):
+            doc = Document.objects.create(
+                title=f"doc {i}",
+                content="paginated content",
+                checksum=f"PG2{i}",
+                archive_serial_number=i + 1,
+            )
+            backend.add_or_update(doc)
+
+        response = self.client.get(
+            "/api/documents/?query=paginated&ordering=archive_serial_number&page=1&page_size=3",
+        )
+        page1_ids = [r["id"] for r in response.data["results"]]
+        self.assertEqual(len(page1_ids), 3)
+
+        response = self.client.get(
+            "/api/documents/?query=paginated&ordering=archive_serial_number&page=2&page_size=3",
+        )
+        page2_ids = [r["id"] for r in response.data["results"]]
+        self.assertEqual(len(page2_ids), 3)
+
+        # No overlap between pages
+        self.assertEqual(set(page1_ids) & set(page2_ids), set())
+        # Page 2 ASNs are higher than page 1
+        page1_asns = [
+            Document.objects.get(pk=pk).archive_serial_number for pk in page1_ids
+        ]
+        page2_asns = [
+            Document.objects.get(pk=pk).archive_serial_number for pk in page2_ids
+        ]
+        self.assertTrue(max(page1_asns) < min(page2_asns))
+
+    def test_search_all_field_contains_all_ids_when_paginated(self) -> None:
+        """The 'all' field must contain every matching ID, even when paginated."""
+        backend = get_backend()
+        doc_ids = []
+        for i in range(10):
+            doc = Document.objects.create(
+                title=f"all field doc {i}",
+                content="allfield content",
+                checksum=f"AF{i}",
+            )
+            backend.add_or_update(doc)
+            doc_ids.append(doc.pk)
+
+        response = self.client.get(
+            "/api/documents/?query=allfield&page=1&page_size=3",
+            headers={"Accept": "application/json; version=9"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data["results"]), 3)
+        # "all" must contain ALL 10 matching IDs
+        self.assertCountEqual(response.data["all"], doc_ids)
 
     @mock.patch("documents.bulk_edit.bulk_update_documents")
     def test_global_search(self, m) -> None:

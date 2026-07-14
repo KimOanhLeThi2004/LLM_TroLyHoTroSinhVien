@@ -302,13 +302,19 @@ Paperless-ngx includes several features that use AI to enhance the document mana
 
 !!! warning
 
-    Remember that Paperless-ngx will send document content to the AI provider you have configured, so consider the privacy implications of using these features, especially if using a remote model (e.g. OpenAI), instead of the default local model.
+    Remember that Paperless-ngx will send document content to the AI provider you have configured,
+    so consider the privacy implications of using these features, especially if using a remote
+    model or API provider instead of the default local model.
 
 The AI features work by creating an embedding of the text content and metadata of documents, which is then used for various tasks such as similarity search and question answering. This uses the FAISS vector store.
 
 ### AI-Enhanced Suggestions
 
-If enabled, Paperless-ngx can use an AI LLM model to suggest document titles, dates, tags, correspondents and document types for documents. This feature will always be "opt-in" and does not disable the existing classifier-based suggestion system. Currently, both remote (via the OpenAI API) and local (via Ollama) models are supported, see [configuration](configuration.md#ai) for details.
+If enabled, Paperless-ngx can use an AI LLM model to suggest document titles, dates, tags,
+correspondents and document types for documents. This feature will always be "opt-in" and does not
+disable the existing classifier-based suggestion system. Currently, both remote
+(via OpenAI-compatible APIs) and local (via Ollama) models are supported, see
+[configuration](configuration.md#ai) for details.
 
 ### Document Chat
 
@@ -414,7 +420,7 @@ still have "object-level" permissions.
 | SavedView        | Add, edit, delete or view Saved Views.                                                                                                                                                                                          |
 | ShareLink        | Add, delete or view Share Links.                                                                                                                                                                                                |
 | StoragePath      | Add, edit, delete or view Storage Paths.                                                                                                                                                                                        |
-| SystemStatus     | View the system status dialog and corresponding API endpoint. Admin users also retain system status access.                                                                                                                     |
+| SystemMonitoring | View the system status dialog, tasks summary and their API endpoints. Admin users also retain system status access.                                                                                                             |
 | Tag              | Add, edit, delete or view Tags.                                                                                                                                                                                                 |
 | UISettings       | Add, edit, delete or view the UI settings that are used by the web app.<br/>:warning: **Users that will access the web UI must be granted at least _View_ permissions.**                                                        |
 | User             | Add, edit, delete or view other user accounts via Settings > Users & Groups and `/api/users/`. These permissions are not needed for users to edit their own profile via "My Profile" or `/api/profile/`.                        |
@@ -855,13 +861,14 @@ Matching natural date keywords:
 ```
 added:today
 modified:yesterday
-created:this_week
-added:last_month
-modified:this_year
+created:"previous week"
+added:"previous month"
+modified:"this year"
 ```
 
-Supported date keywords: `today`, `yesterday`, `this_week`, `last_week`,
-`this_month`, `last_month`, `this_year`, `last_year`.
+Supported date keywords: `today`, `yesterday`, `previous week`,
+`this month`, `previous month`, `this year`, `previous year`,
+`previous quarter`.
 
 #### Searching custom fields
 

@@ -72,7 +72,7 @@ def has_system_status_permission(user: User | None) -> bool:
     return (
         getattr(user, "is_superuser", False)
         or getattr(user, "is_staff", False)
-        or user.has_perm("paperless.view_system_status")
+        or user.has_perm("paperless.view_system_monitoring")
     )
 
 
@@ -261,7 +261,7 @@ def get_objects_for_user_owner_aware(
     Model: Any,
     *,
     include_deleted: bool = False,
-) -> QuerySet:
+) -> QuerySet[Any]:
     """
     Returns objects the user owns, are unowned, or has explicit perms.
     When include_deleted is True, soft-deleted items are also included.

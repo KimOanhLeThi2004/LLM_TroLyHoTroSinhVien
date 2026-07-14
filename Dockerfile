@@ -30,7 +30,7 @@ RUN set -eux \
 # Purpose: Installs s6-overlay and rootfs
 # Comments:
 #  - Don't leave anything extra in here either
-FROM ghcr.io/astral-sh/uv:0.10.9-python3.12-trixie-slim AS s6-overlay-base
+FROM ghcr.io/astral-sh/uv:0.11.19-python3.12-trixie-slim AS s6-overlay-base
 
 WORKDIR /usr/src/s6
 
@@ -195,7 +195,7 @@ RUN set -eux \
   && echo "Installing Python requirements" \
     && uv export --quiet --no-dev --all-extras --format requirements-txt --output-file requirements.txt \
     && uv pip install --no-cache --system --no-python-downloads --python-preference system \
-      --index https://pypi.org/simple \
+      --default-index https://pypi.org/simple \
       --index https://download.pytorch.org/whl/cpu \
       --index-strategy unsafe-best-match \
       --requirements requirements.txt \
@@ -224,6 +224,7 @@ COPY --from=compile-frontend --chown=1000:1000 /src/src/documents/static/fronten
 # Mount the compiled frontend to expected location
 RUN set -eux \
   && sed -i '1s|^#!/usr/bin/env python3|#!/command/with-contenv python3|' manage.py \
+  && find /etc/s6-overlay /usr/local/bin -type f -exec sed -i 's/\r$//' {} + \
   && echo "Setting up user/group" \
     && addgroup --gid 1000 paperless \
     && useradd --uid 1000 --gid paperless --home-dir /usr/src/paperless paperless \
@@ -236,6 +237,8 @@ RUN set -eux \
     && mkdir -m700 --verbose /usr/src/paperless/.gnupg \
   && echo "Adjusting all permissions" \
     && chown --from root:root --changes --recursive paperless:paperless /usr/src/paperless \
+  && echo "Making fontconfig cache writable for arbitrary container UIDs" \
+    && chmod 1777 /var/cache/fontconfig \
   && echo "Collecting static files" \
     && PAPERLESS_SECRET_KEY=build-time-dummy s6-setuidgid paperless python3 manage.py collectstatic --clear --no-input --link \
     && PAPERLESS_SECRET_KEY=build-time-dummy s6-setuidgid paperless python3 manage.py compilemessages \

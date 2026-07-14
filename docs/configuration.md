@@ -101,7 +101,7 @@ and `mariadb`.
 
 #### [`PAPERLESS_DB_OPTIONS=<options>`](#PAPERLESS_DB_OPTIONS) {#PAPERLESS_DB_OPTIONS}
 
-: Advanced database connection options as a semicolon-delimited key-value string.
+: Advanced database connection options as a comma-delimited key-value string.
 Keys and values are separated by `=`. Dot-notation produces nested option
 dictionaries; for example, `pool.max_size=20` sets
 `OPTIONS["pool"]["max_size"] = 20`.
@@ -123,18 +123,36 @@ dictionaries; for example, `pool.max_size=20` sets
         to handle all pool connections across all workers:
         `(web_workers + celery_workers) * pool.max_size + safety_margin`.
 
+    !!! note "SQLite defaults"
+
+        SQLite connections are pre-configured with WAL journal mode, optimised
+        synchronous and cache settings, and a 5-second busy timeout. These defaults
+        suit most deployments. To override `init_command`, use `;` between PRAGMAs
+        within the value and `,` between options:
+
+        ```bash
+        PAPERLESS_DB_OPTIONS="init_command=PRAGMA journal_mode=DELETE;PRAGMA synchronous=FULL,transaction_mode=DEFERRED"
+        ```
+
+    !!! note "MariaDB: READ COMMITTED isolation level"
+
+        MariaDB connections default to `READ COMMITTED` isolation level, which
+        eliminates gap locking and reduces deadlock frequency. If binary logging is
+        enabled on your MariaDB server, this requires `binlog_format=ROW` (the
+        default for most managed MariaDB instances). Statement-based replication is
+        not compatible with `READ COMMITTED`.
+
     **Examples:**
 
     ```bash title="PostgreSQL: require SSL, set a custom CA certificate, and limit the pool size"
-    PAPERLESS_DB_OPTIONS="sslmode=require;sslrootcert=/certs/ca.pem;pool.max_size=5"
+    PAPERLESS_DB_OPTIONS="sslmode=require,sslrootcert=/certs/ca.pem,pool.max_size=5"
     ```
 
     ```bash title="MariaDB: require SSL with a custom CA certificate"
-    PAPERLESS_DB_OPTIONS="ssl_mode=REQUIRED;ssl.ca=/certs/ca.pem"
+    PAPERLESS_DB_OPTIONS="ssl_mode=REQUIRED,ssl.ca=/certs/ca.pem"
     ```
 
-    ```bash title="SQLite: set a busy timeout of 30 seconds"
-    # PostgreSQL: set a connection timeout
+    ```bash title="PostgreSQL or MariaDB: set a connection timeout"
     PAPERLESS_DB_OPTIONS="connect_timeout=10"
     ```
 
@@ -500,7 +518,24 @@ do CORS calls. Set this to your public domain name.
 fail2ban with log entries for failed authorization attempts. Value should be
 IP address(es).
 
+    This setting also controls allauth's
+    [`ALLAUTH_TRUSTED_PROXY_COUNT`](https://docs.allauth.org/en/latest/account/configuration.html),
+    which is set to the number of proxies listed here. Without this,
+    allauth cannot determine the client IP address for rate limiting when
+    running behind a reverse proxy, resulting in a `403 Forbidden` on login.
+
     Defaults to empty string.
+
+#### [`PAPERLESS_ALLAUTH_TRUSTED_CLIENT_IP_HEADER=<header-name>`](#PAPERLESS_ALLAUTH_TRUSTED_CLIENT_IP_HEADER) {#PAPERLESS_ALLAUTH_TRUSTED_CLIENT_IP_HEADER}
+
+: Sets allauth's
+[`ALLAUTH_TRUSTED_CLIENT_IP_HEADER`](https://docs.allauth.org/en/latest/account/configuration.html).
+Use this when your reverse proxy sets a dedicated header for the real
+client IP instead of `X-Forwarded-For`, for example `X-Real-IP` (nginx)
+or `CF-Connecting-IP` (Cloudflare). When set, this takes precedence over
+[`PAPERLESS_TRUSTED_PROXIES`](#PAPERLESS_TRUSTED_PROXIES).
+
+    Defaults to none.
 
 #### [`PAPERLESS_FORCE_SCRIPT_NAME=<path>`](#PAPERLESS_FORCE_SCRIPT_NAME) {#PAPERLESS_FORCE_SCRIPT_NAME}
 
@@ -954,7 +989,7 @@ pages being rotated as well.
 
 #### [`PAPERLESS_OCR_OUTPUT_TYPE=<type>`](#PAPERLESS_OCR_OUTPUT_TYPE) {#PAPERLESS_OCR_OUTPUT_TYPE}
 
-: Specify the the type of PDF documents that paperless should produce.
+: Specify the type of PDF documents that paperless should produce.
 
     -   `pdf`: Modify the PDF document as little as possible.
     -   `pdfa`: Convert PDF documents into PDF/A-2b documents, which is
@@ -1996,49 +2031,86 @@ suggestions. This setting is required to be set to true in order to use the AI f
 
 #### [`PAPERLESS_AI_LLM_EMBEDDING_BACKEND=<str>`](#PAPERLESS_AI_LLM_EMBEDDING_BACKEND) {#PAPERLESS_AI_LLM_EMBEDDING_BACKEND}
 
-: The embedding backend to use for RAG. This can be either "openai" or "huggingface".
+: The embedding backend to use for RAG. This can be "openai-like", "huggingface", or
+"ollama". The "openai-like" backend uses an OpenAI-compatible embeddings API.
 
     Defaults to None.
 
 #### [`PAPERLESS_AI_LLM_EMBEDDING_MODEL=<str>`](#PAPERLESS_AI_LLM_EMBEDDING_MODEL) {#PAPERLESS_AI_LLM_EMBEDDING_MODEL}
 
-: The model to use for the embedding backend for RAG. This can be set to any of the embedding models supported by the current embedding backend. If not supplied, defaults to "text-embedding-3-small" for OpenAI and "sentence-transformers/all-MiniLM-L6-v2" for Huggingface.
+: The model to use for the embedding backend for RAG. This can be set to any of the embedding
+models supported by the current embedding backend. If not supplied, defaults to
+"text-embedding-3-small" for the OpenAI-compatible backend,
+"sentence-transformers/all-MiniLM-L6-v2" for Huggingface, and "embeddinggemma" for Ollama.
 
     Defaults to None.
 
+#### [`PAPERLESS_AI_LLM_EMBEDDING_ENDPOINT=<str>`](#PAPERLESS_AI_LLM_EMBEDDING_ENDPOINT) {#PAPERLESS_AI_LLM_EMBEDDING_ENDPOINT}
+
+: The endpoint / url to use for the embedding backend. If not supplied, embeddings use
+`PAPERLESS_AI_LLM_ENDPOINT`.
+
+    Defaults to None.
+
+#### [`PAPERLESS_AI_LLM_EMBEDDING_CHUNK_SIZE=<int>`](#PAPERLESS_AI_LLM_EMBEDDING_CHUNK_SIZE) {#PAPERLESS_AI_LLM_EMBEDDING_CHUNK_SIZE}
+
+: The chunk size to use when splitting document text for RAG embeddings. Lower this value if your
+embedding backend or model rejects larger inputs, or silently truncates inputs in a way that harms
+retrieval quality.
+
+    Defaults to 1024.
+
+#### [`PAPERLESS_AI_LLM_CONTEXT_SIZE=<int>`](#PAPERLESS_AI_LLM_CONTEXT_SIZE) {#PAPERLESS_AI_LLM_CONTEXT_SIZE}
+
+: The context size to use for AI prompts and RAG retrieval. For Ollama backends, this is also sent
+as `num_ctx` so models with very large native context windows are not loaded at their maximum
+context by default.
+
+    Defaults to 8192.
+
 #### [`PAPERLESS_AI_LLM_BACKEND=<str>`](#PAPERLESS_AI_LLM_BACKEND) {#PAPERLESS_AI_LLM_BACKEND}
 
-: The AI backend to use. This can be either "openai" or "ollama". If set to "ollama", the AI
-features will be run locally on your machine. If set to "openai", the AI features will be run
-using the OpenAI API. This setting is required to be set to use the AI features.
+: The AI backend to use. This can be either "openai-like" or "ollama". If set to "ollama", the AI
+features will be run locally on your machine. If set to "openai-like", the AI features will use
+an OpenAI-compatible API endpoint, including OpenAI itself and compatible providers. This
+setting is required to be set to use the AI features.
 
     Defaults to None.
 
     !!! note
 
-        The OpenAI API is a paid service. You will need to set up an OpenAI account and
-        will be charged for usage incurred by Paperless-ngx features and your document data
-        will (of course) be sent to the OpenAI API. Paperless-ngx does not endorse the use of the
-        OpenAI API in any way.
+        Remote AI providers may be paid services. If you use a hosted OpenAI-compatible API, you
+        are responsible for any usage charges incurred by Paperless-ngx features, and your
+        document data will be sent to the provider you configure.
 
-        Refer to the OpenAI terms of service, and use at your own risk.
+        Paperless-ngx does not endorse any specific provider. Refer to your provider's terms of
+        service and privacy policy, and use at your own risk.
 
 #### [`PAPERLESS_AI_LLM_MODEL=<str>`](#PAPERLESS_AI_LLM_MODEL) {#PAPERLESS_AI_LLM_MODEL}
 
-: The model to use for the AI backend, i.e. "gpt-3.5-turbo", "gpt-4" or any of the models supported by the
-current backend. If not supplied, defaults to "gpt-3.5-turbo" for OpenAI and "llama3.1" for Ollama.
+: The model to use for the AI backend, i.e. "gpt-3.5-turbo", "gpt-4" or any of the models supported
+by the current backend. If not supplied, defaults to "gpt-3.5-turbo" for the OpenAI-compatible
+backend and "llama3.1" for Ollama.
 
     Defaults to None.
 
 #### [`PAPERLESS_AI_LLM_API_KEY=<str>`](#PAPERLESS_AI_LLM_API_KEY) {#PAPERLESS_AI_LLM_API_KEY}
 
-: The API key to use for the AI backend. This is required for the OpenAI backend (optional for others).
+: The API key to use for the AI backend. This is typically required for the OpenAI-compatible
+backend (optional for others).
 
     Defaults to None.
 
 #### [`PAPERLESS_AI_LLM_ENDPOINT=<str>`](#PAPERLESS_AI_LLM_ENDPOINT) {#PAPERLESS_AI_LLM_ENDPOINT}
 
-: The endpoint / url to use for the AI backend. This is required for the Ollama backend (optional for others).
+: The endpoint / url to use for the AI backend. This is required for the Ollama backend and may be
+used with the OpenAI-compatible backend to target a custom provider or local gateway.
+
+    Defaults to None.
+
+### [`PAPERLESS_AI_LLM_OUTPUT_LANGUAGE=<str>`](#PAPERLESS_AI_LLM_OUTPUT_LANGUAGE) {#PAPERLESS_AI_LLM_OUTPUT_LANGUAGE}
+
+: The language to use for AI suggestions (results may vary by LLM model). If not supplied, defaults to the user's UI language setting or None.
 
     Defaults to None.
 

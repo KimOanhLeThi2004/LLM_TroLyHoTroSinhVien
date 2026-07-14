@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 import logging
 import shutil
 from typing import TYPE_CHECKING
+from typing import Final
+from typing import cast
 
 import tantivy
 from django.conf import settings
@@ -12,7 +15,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("paperless.search")
 
-SCHEMA_VERSION = 1
+# v1 - Initial tantivy schema format
+SCHEMA_VERSION: Final[int] = 1
 
 
 def build_schema() -> tantivy.Schema:
@@ -52,6 +56,18 @@ def build_schema() -> tantivy.Schema:
 
     # CJK support - not stored, indexed only
     sb.add_text_field("bigram_content", stored=False, tokenizer_name="bigram_analyzer")
+    sb.add_text_field("bigram_title", stored=False, tokenizer_name="bigram_analyzer")
+    sb.add_text_field(
+        "bigram_correspondent",
+        stored=False,
+        tokenizer_name="bigram_analyzer",
+    )
+    sb.add_text_field(
+        "bigram_document_type",
+        stored=False,
+        tokenizer_name="bigram_analyzer",
+    )
+    sb.add_text_field("bigram_tag", stored=False, tokenizer_name="bigram_analyzer")
 
     # Simple substring search support for title/content - not stored, indexed only
     sb.add_text_field(
@@ -65,13 +81,18 @@ def build_schema() -> tantivy.Schema:
         tokenizer_name="simple_search_analyzer",
     )
 
-    # Autocomplete prefix scan - stored, not indexed
-    sb.add_text_field("autocomplete_word", stored=True, tokenizer_name="raw")
+    # Autocomplete prefix scan via terms_with_prefix, which walks the field's
+    # term dictionary - so the field must be indexed (term dict), not stored.
+    # The stored value is never read back, so storing it only wastes space.
+    sb.add_text_field("autocomplete_word", stored=False, tokenizer_name="raw")
 
     sb.add_text_field("tag", stored=True, tokenizer_name="paperless_text")
 
     # JSON fields — structured queries: notes.user:alice, custom_fields.name:invoice
     sb.add_json_field("notes", stored=True, tokenizer_name="paperless_text")
+    # Plain-text companion for notes — tantivy's SnippetGenerator does not support
+    # JSON fields, so highlights require a text field with the same content.
+    sb.add_text_field("notes_text", stored=True, tokenizer_name="paperless_text")
     sb.add_json_field("custom_fields", stored=True, tokenizer_name="paperless_text")
 
     for field in (
@@ -97,9 +118,9 @@ def needs_rebuild(index_dir: Path) -> bool:
     """
     Check if the search index needs rebuilding.
 
-    Compares the current schema version and search language configuration
-    against sentinel files to determine if the index is compatible with
-    the current paperless-ngx version and settings.
+    Reads .index_settings.json to compare the stored schema version and
+    search language against the current configuration. Returns True if the
+    file is missing, unparsable, or either value mismatches.
 
     Args:
         index_dir: Path to the search index directory
@@ -107,24 +128,19 @@ def needs_rebuild(index_dir: Path) -> bool:
     Returns:
         True if the index needs rebuilding, False if it's up to date
     """
-    version_file = index_dir / ".schema_version"
-    if not version_file.exists():
+    settings_file = index_dir / ".index_settings.json"
+    if not settings_file.exists():
         return True
     try:
-        if int(version_file.read_text().strip()) != SCHEMA_VERSION:
+        data = json.loads(settings_file.read_text())
+        if data.get("schema_version") != SCHEMA_VERSION:
             logger.info("Search index schema version mismatch - rebuilding.")
+            return True
+        if "language" not in data or data["language"] != settings.SEARCH_LANGUAGE:
+            logger.info("Search index language changed - rebuilding.")
             return True
     except ValueError:
         return True
-
-    language_file = index_dir / ".schema_language"
-    if not language_file.exists():
-        logger.info("Search index language sentinel missing - rebuilding.")
-        return True
-    if language_file.read_text().strip() != (settings.SEARCH_LANGUAGE or ""):
-        logger.info("Search index language changed - rebuilding.")
-        return True
-
     return False
 
 
@@ -146,9 +162,16 @@ def wipe_index(index_dir: Path) -> None:
 
 
 def _write_sentinels(index_dir: Path) -> None:
-    """Write schema version and language sentinel files so the next index open can skip rebuilding."""
-    (index_dir / ".schema_version").write_text(str(SCHEMA_VERSION))
-    (index_dir / ".schema_language").write_text(settings.SEARCH_LANGUAGE or "")
+    """Write .index_settings.json so the next index open can skip rebuilding."""
+    settings_file = index_dir / ".index_settings.json"
+    settings_file.write_text(
+        json.dumps(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "language": settings.SEARCH_LANGUAGE,
+            },
+        ),
+    )
 
 
 def open_or_rebuild_index(index_dir: Path | None = None) -> tantivy.Index:
@@ -166,7 +189,7 @@ def open_or_rebuild_index(index_dir: Path | None = None) -> tantivy.Index:
         Opened Tantivy index (caller must register custom tokenizers)
     """
     if index_dir is None:
-        index_dir = settings.INDEX_DIR
+        index_dir = cast("Path", settings.INDEX_DIR)
     if not index_dir.exists():
         return tantivy.Index(build_schema())
     if needs_rebuild(index_dir):

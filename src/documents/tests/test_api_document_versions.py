@@ -18,6 +18,7 @@ from documents.filters import EffectiveContentFilter
 from documents.filters import TitleContentFilter
 from documents.models import Document
 from documents.tests.utils import DirectoriesMixin
+from documents.tests.utils import read_streaming_response
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -449,19 +450,53 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
             f"/api/documents/{root.id}/download/?version={version.id}",
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
-        self.assertEqual(resp.content, b"version")
+        self.assertEqual(read_streaming_response(resp), b"version")
 
         resp = self.client.get(
             f"/api/documents/{root.id}/preview/?version={version.id}",
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
-        self.assertEqual(resp.content, b"version")
+        self.assertEqual(read_streaming_response(resp), b"version")
 
         resp = self.client.get(
             f"/api/documents/{root.id}/thumb/?version={version.id}",
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
-        self.assertEqual(resp.content, b"thumb")
+        self.assertEqual(read_streaming_response(resp), b"thumb")
+
+    def test_thumb_etag_changes_when_latest_version_is_deleted(self) -> None:
+        root = self._create_pdf(title="root", checksum="root")
+        v1 = self._create_pdf(
+            title="v1",
+            checksum="v1",
+            root_document=root,
+        )
+        v2 = self._create_pdf(
+            title="v2",
+            checksum="v2",
+            root_document=root,
+        )
+        self._write_file(v1.thumbnail_path, b"thumb-v1")
+        self._write_file(v2.thumbnail_path, b"thumb-v2")
+
+        resp = self.client.get(f"/api/documents/{root.id}/thumb/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(read_streaming_response(resp), b"thumb-v2")
+        self.assertEqual(resp.headers["ETag"], '"v2"')
+
+        with mock.patch("documents.search.get_backend"):
+            delete_resp = self.client.delete(
+                f"/api/documents/{root.id}/versions/{v2.id}/",
+            )
+        self.assertEqual(delete_resp.status_code, status.HTTP_200_OK)
+
+        resp = self.client.get(
+            f"/api/documents/{root.id}/thumb/",
+            HTTP_IF_NONE_MATCH='"v2"',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.headers["ETag"], '"v1"')
+        self.assertEqual(read_streaming_response(resp), b"thumb-v1")
 
     def test_metadata_version_param_uses_version(self) -> None:
         root = Document.objects.create(
@@ -537,7 +572,7 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
         async_task.id = "task-123"
 
         with mock.patch("documents.views.consume_file") as consume_mock:
-            consume_mock.delay.return_value = async_task
+            consume_mock.apply_async.return_value = async_task
             resp = self.client.post(
                 f"/api/documents/{root.id}/update_version/",
                 {"document": upload, "version_label": "  New Version  "},
@@ -546,8 +581,9 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
 
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.assertEqual(resp.data, "task-123")
-        consume_mock.delay.assert_called_once()
-        input_doc, overrides = consume_mock.delay.call_args[0]
+        consume_mock.apply_async.assert_called_once()
+        task_kwargs = consume_mock.apply_async.call_args.kwargs["kwargs"]
+        input_doc, overrides = task_kwargs["input_doc"], task_kwargs["overrides"]
         self.assertEqual(input_doc.root_document_id, root.id)
         self.assertEqual(input_doc.source, DocumentSource.ApiUpload)
         self.assertEqual(overrides.version_label, "New Version")
@@ -571,7 +607,7 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
         async_task.id = "task-123"
 
         with mock.patch("documents.views.consume_file") as consume_mock:
-            consume_mock.delay.return_value = async_task
+            consume_mock.apply_async.return_value = async_task
             resp = self.client.post(
                 f"/api/documents/{version.id}/update_version/",
                 {"document": upload, "version_label": "  New Version  "},
@@ -580,8 +616,9 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
 
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.assertEqual(resp.data, "task-123")
-        consume_mock.delay.assert_called_once()
-        input_doc, overrides = consume_mock.delay.call_args[0]
+        consume_mock.apply_async.assert_called_once()
+        task_kwargs = consume_mock.apply_async.call_args.kwargs["kwargs"]
+        input_doc, overrides = task_kwargs["input_doc"], task_kwargs["overrides"]
         self.assertEqual(input_doc.root_document_id, root.id)
         self.assertEqual(overrides.version_label, "New Version")
         self.assertEqual(overrides.actor_id, self.user.id)
@@ -595,7 +632,7 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
         upload = self._make_pdf_upload()
 
         with mock.patch("documents.views.consume_file") as consume_mock:
-            consume_mock.delay.side_effect = Exception("boom")
+            consume_mock.apply_async.side_effect = Exception("boom")
             resp = self.client.post(
                 f"/api/documents/{root.id}/update_version/",
                 {"document": upload},

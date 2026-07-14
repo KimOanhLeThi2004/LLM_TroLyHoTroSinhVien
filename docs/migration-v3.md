@@ -1,5 +1,9 @@
 # v3 Migration Guide
 
+## Pre-Requisites
+
+Upgrading to Paperless-ngx v3 can only be performed from version 2.20.15. If you are running an older version, please upgrade to v2.20.15 before proceeding with the v3 upgrade.
+
 ## Secret Key is Now Required
 
 The `PAPERLESS_SECRET_KEY` environment variable is now required. This is a critical security setting used for cryptographic signing and should be set to a long, random value.
@@ -36,6 +40,10 @@ separating the directory ignore from the file ignore.
 | `CONSUMER_POLLING_RETRY_COUNT` | _Removed_                                                                           | Automatic with stability tracking                                                    |
 | `CONSUMER_IGNORE_PATTERNS`     | [`CONSUMER_IGNORE_PATTERNS`](configuration.md#PAPERLESS_CONSUMER_IGNORE_PATTERNS)   | **Now regex, not fnmatch**; user patterns are added to (not replacing) default ones  |
 | _New_                          | [`CONSUMER_IGNORE_DIRS`](configuration.md#PAPERLESS_CONSUMER_IGNORE_DIRS)           | Additional directories to ignore; user entries are added to (not replacing) defaults |
+
+## Duplicate Handling Changes
+
+Paperless-ngx v3 no longer rejects duplicate documents by default. Instead, it now allows duplicates but adds a way to identify them via the UI. To (re-)enable duplicate rejection, set `PAPERLESS_CONSUMER_DELETE_DUPLICATES=true` in your environment.
 
 ## Encryption Support
 
@@ -120,7 +128,7 @@ Users with any of the deprecated variables set should migrate to `PAPERLESS_DB_O
 Multiple options are combined in a single value:
 
 ```bash
-PAPERLESS_DB_OPTIONS="sslmode=require;sslrootcert=/certs/ca.pem;pool.max_size=10"
+PAPERLESS_DB_OPTIONS="sslmode=require,sslrootcert=/certs/ca.pem,pool.max_size=10"
 ```
 
 ## OCR and Archive File Generation Settings
@@ -242,6 +250,12 @@ For example:
 }
 ```
 
+## Task History Cleared on Upgrade
+
+The task tracking system has been redesigned in this release. All existing task history records are dropped from the database during the upgrade. Previously completed, failed, or acknowledged tasks will no longer appear in the task list after upgrading.
+
+No user action is required.
+
 ## Consume Script Positional Arguments Removed
 
 Pre- and post-consumption scripts no longer receive positional arguments. All information is
@@ -304,3 +318,11 @@ echo "Document ${DOCUMENT_ID} from ${DOCUMENT_CORRESPONDENT} tagged: ${DOCUMENT_
 Update any pre- or post-consumption scripts that read `$1`, `$2`, etc. to use the
 corresponding environment variables instead. Environment variables have been the preferred
 option since v1.8.0.
+
+## Reverse Proxy and Login Rate Limiting
+
+Allauth changed how it determines the client IP address for login rate limiting. Users running
+behind a reverse proxy may need to set
+[`PAPERLESS_TRUSTED_PROXIES`](configuration.md#PAPERLESS_TRUSTED_PROXIES),
+[`PAPERLESS_ALLAUTH_TRUSTED_CLIENT_IP_HEADER`](configuration.md#PAPERLESS_ALLAUTH_TRUSTED_CLIENT_IP_HEADER),
+or both, to avoid `403 Forbidden` errors on login.

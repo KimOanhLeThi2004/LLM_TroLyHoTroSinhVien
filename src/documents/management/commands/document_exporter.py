@@ -6,6 +6,7 @@ import tempfile
 from itertools import islice
 from pathlib import Path
 from typing import TYPE_CHECKING
+from typing import Any
 
 from allauth.mfa.models import Authenticator
 from allauth.socialaccount.models import SocialAccount
@@ -68,7 +69,7 @@ from paperless_mail.models import MailRule
 
 
 def serialize_queryset_batched(
-    queryset: "QuerySet",
+    queryset: "QuerySet[Any]",
     *,
     batch_size: int = 500,
 ) -> "Generator[list[dict], None, None]":
@@ -364,7 +365,8 @@ class Command(CryptMixin, PaperlessCommand):
 
         # 2. Create manifest, containing all correspondents, types, tags, storage paths
         # note, documents and ui_settings
-        manifest_key_to_object_query: dict[str, QuerySet] = {
+        _excluded_usernames = ["consumer", "AnonymousUser"]
+        manifest_key_to_object_query: dict[str, QuerySet[Any]] = {
             "correspondents": Correspondent.objects.all(),
             "tags": Tag.objects.all(),
             "document_types": DocumentType.objects.all(),
@@ -375,12 +377,16 @@ class Command(CryptMixin, PaperlessCommand):
             "saved_view_filter_rules": SavedViewFilterRule.objects.all(),
             "groups": Group.objects.all(),
             "users": User.objects.exclude(
-                username__in=["consumer", "AnonymousUser"],
+                username__in=_excluded_usernames,
             ).all(),
-            "ui_settings": UiSettings.objects.all(),
+            "ui_settings": UiSettings.objects.exclude(
+                user__username__in=_excluded_usernames,
+            ),
             "content_types": ContentType.objects.all(),
             "permissions": Permission.objects.all(),
-            "user_object_permissions": UserObjectPermission.objects.all(),
+            "user_object_permissions": UserObjectPermission.objects.exclude(
+                user__username__in=_excluded_usernames,
+            ),
             "group_object_permissions": GroupObjectPermission.objects.all(),
             "workflow_triggers": WorkflowTrigger.objects.all(),
             "workflow_actions": WorkflowAction.objects.all(),
@@ -394,10 +400,16 @@ class Command(CryptMixin, PaperlessCommand):
             "documents": Document.global_objects.order_by("id").all(),
             "share_links": ShareLink.global_objects.all(),
             "share_link_bundles": ShareLinkBundle.objects.order_by("id").all(),
-            "social_accounts": SocialAccount.objects.all(),
+            "social_accounts": SocialAccount.objects.exclude(
+                user__username__in=_excluded_usernames,
+            ),
             "social_apps": SocialApp.objects.all(),
-            "social_tokens": SocialToken.objects.all(),
-            "authenticators": Authenticator.objects.all(),
+            "social_tokens": SocialToken.objects.exclude(
+                account__user__username__in=_excluded_usernames,
+            ),
+            "authenticators": Authenticator.objects.exclude(
+                user__username__in=_excluded_usernames,
+            ),
         }
 
         if settings.AUDIT_LOG_ENABLED:

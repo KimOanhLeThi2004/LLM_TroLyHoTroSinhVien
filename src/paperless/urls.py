@@ -36,6 +36,7 @@ from documents.views import RotateDocumentsView
 from documents.views import SavedViewViewSet
 from documents.views import SearchAutoCompleteView
 from documents.views import SearchFullTextView
+from documents.views import SearchHybridView
 from documents.views import SearchPreprocessView
 from documents.views import SelectionDataView
 from documents.views import SharedLinkView
@@ -100,7 +101,21 @@ urlpatterns = [
                 re_path(
                     "^auth/",
                     include(
-                        ("rest_framework.urls", "rest_framework"),
+                        (
+                            [
+                                path(
+                                    "login/",
+                                    allauth_account_views.login,
+                                    name="login",
+                                ),
+                                path(
+                                    "logout/",
+                                    allauth_account_views.logout,
+                                    name="logout",
+                                ),
+                            ],
+                            "rest_framework",
+                        ),
                         namespace="rest_framework",
                     ),
                 ),
@@ -127,6 +142,11 @@ urlpatterns = [
                                 "^fulltext/",
                                 SearchFullTextView.as_view(),
                                 name="search_fulltext",
+                            ),
+                            re_path(
+                                "^hybrid/",
+                                SearchHybridView.as_view(),
+                                name="search_hybrid",
                             ),
                         ],
                     ),

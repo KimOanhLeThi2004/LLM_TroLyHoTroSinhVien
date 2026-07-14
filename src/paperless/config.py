@@ -38,7 +38,9 @@ class OutputTypeConfig(BaseConfig):
     def __post_init__(self) -> None:
         app_config = self._get_config_instance()
 
-        self.output_type = app_config.output_type or settings.OCR_OUTPUT_TYPE
+        self.output_type = app_config.output_type or OutputTypeChoices(
+            settings.OCR_OUTPUT_TYPE,
+        )
 
 
 @dataclasses.dataclass
@@ -70,12 +72,13 @@ class OcrConfig(OutputTypeConfig):
 
         self.pages = app_config.pages or settings.OCR_PAGES
         self.language = app_config.language or settings.OCR_LANGUAGE
-        self.mode = app_config.mode or settings.OCR_MODE
+        self.mode = app_config.mode or ModeChoices(settings.OCR_MODE)
         self.archive_file_generation = (
-            app_config.archive_file_generation or settings.ARCHIVE_FILE_GENERATION
+            app_config.archive_file_generation
+            or ArchiveFileGenerationChoices(settings.ARCHIVE_FILE_GENERATION)
         )
         self.image_dpi = app_config.image_dpi or settings.OCR_IMAGE_DPI
-        self.clean = app_config.unpaper_clean or settings.OCR_CLEAN
+        self.clean = app_config.unpaper_clean or CleanChoices(settings.OCR_CLEAN)
         self.deskew = (
             app_config.deskew if app_config.deskew is not None else settings.OCR_DESKEW
         )
@@ -92,7 +95,7 @@ class OcrConfig(OutputTypeConfig):
         )
         self.color_conversion_strategy = (
             app_config.color_conversion_strategy
-            or settings.OCR_COLOR_CONVERSION_STRATEGY
+            or ColorConvertChoices(settings.OCR_COLOR_CONVERSION_STRATEGY)
         )
 
         user_args = None
@@ -191,10 +194,14 @@ class AIConfig(BaseConfig):
     ai_enabled: bool = dataclasses.field(init=False)
     llm_embedding_backend: str = dataclasses.field(init=False)
     llm_embedding_model: str = dataclasses.field(init=False)
+    llm_embedding_endpoint: str = dataclasses.field(init=False)
+    llm_embedding_chunk_size: int = dataclasses.field(init=False)
+    llm_context_size: int = dataclasses.field(init=False)
     llm_backend: str = dataclasses.field(init=False)
     llm_model: str = dataclasses.field(init=False)
     llm_api_key: str = dataclasses.field(init=False)
     llm_endpoint: str = dataclasses.field(init=False)
+    llm_output_language: str = dataclasses.field(init=False)
     llm_allow_internal_endpoints: bool = dataclasses.field(init=False)
 
     def __post_init__(self) -> None:
@@ -207,10 +214,20 @@ class AIConfig(BaseConfig):
         self.llm_embedding_model = (
             app_config.llm_embedding_model or settings.LLM_EMBEDDING_MODEL
         )
+        self.llm_embedding_endpoint = (
+            app_config.llm_embedding_endpoint or settings.LLM_EMBEDDING_ENDPOINT
+        )
+        self.llm_embedding_chunk_size = (
+            app_config.llm_embedding_chunk_size or settings.LLM_EMBEDDING_CHUNK_SIZE
+        )
+        self.llm_context_size = app_config.llm_context_size or settings.LLM_CONTEXT_SIZE
         self.llm_backend = app_config.llm_backend or settings.LLM_BACKEND
         self.llm_model = app_config.llm_model or settings.LLM_MODEL
         self.llm_api_key = app_config.llm_api_key or settings.LLM_API_KEY
         self.llm_endpoint = app_config.llm_endpoint or settings.LLM_ENDPOINT
+        self.llm_output_language = (
+            app_config.llm_output_language or settings.LLM_OUTPUT_LANGUAGE
+        )
         self.llm_allow_internal_endpoints = settings.LLM_ALLOW_INTERNAL_ENDPOINTS
 
     @property

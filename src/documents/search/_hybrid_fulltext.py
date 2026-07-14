@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from documents.search._normalize import ascii_fold
 from documents.search._query_preprocessor import PreprocessedQuery
+from documents.search._tokenizer import ascii_fold
 
 
 @dataclass(frozen=True, slots=True)

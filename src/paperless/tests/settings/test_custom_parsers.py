@@ -186,42 +186,66 @@ def make_expected_schedule(
         "Check all e-mail accounts": {
             "task": "paperless_mail.tasks.process_mail_accounts",
             "schedule": crontab(minute="*/10"),
-            "options": {"expires": mail_expire},
+            "options": {
+                "expires": mail_expire,
+                "headers": {"trigger_source": "scheduled"},
+            },
         },
         "Train the classifier": {
             "task": "documents.tasks.train_classifier",
             "schedule": crontab(minute="5", hour="*/1"),
-            "options": {"expires": classifier_expire},
+            "options": {
+                "expires": classifier_expire,
+                "headers": {"trigger_source": "scheduled"},
+            },
         },
         "Optimize the index": {
             "task": "documents.tasks.index_optimize",
             "schedule": crontab(minute=0, hour=0),
-            "options": {"expires": index_expire},
+            "options": {
+                "expires": index_expire,
+                "headers": {"trigger_source": "scheduled"},
+            },
         },
         "Perform sanity check": {
             "task": "documents.tasks.sanity_check",
             "schedule": crontab(minute=30, hour=0, day_of_week="sun"),
-            "options": {"expires": sanity_expire},
+            "options": {
+                "expires": sanity_expire,
+                "headers": {"trigger_source": "scheduled"},
+            },
         },
         "Empty trash": {
             "task": "documents.tasks.empty_trash",
             "schedule": crontab(minute=0, hour="1"),
-            "options": {"expires": empty_trash_expire},
+            "options": {
+                "expires": empty_trash_expire,
+                "headers": {"trigger_source": "scheduled"},
+            },
         },
         "Check and run scheduled workflows": {
             "task": "documents.tasks.check_scheduled_workflows",
             "schedule": crontab(minute="5", hour="*/1"),
-            "options": {"expires": workflow_expire},
+            "options": {
+                "expires": workflow_expire,
+                "headers": {"trigger_source": "scheduled"},
+            },
         },
         "Rebuild LLM index": {
             "task": "documents.tasks.llmindex_index",
             "schedule": crontab(minute="10", hour="2"),
-            "options": {"expires": llm_index_expire},
+            "options": {
+                "expires": llm_index_expire,
+                "headers": {"trigger_source": "scheduled"},
+            },
         },
         "Cleanup expired share link bundles": {
             "task": "documents.tasks.cleanup_expired_share_link_bundles",
             "schedule": crontab(minute=0, hour="2"),
-            "options": {"expires": share_link_cleanup_expire},
+            "options": {
+                "expires": share_link_cleanup_expire,
+                "headers": {"trigger_source": "scheduled"},
+            },
         },
     }
 
@@ -284,6 +308,16 @@ class TestParseBeatSchedule:
         schedule = parse_beat_schedule()
         assert schedule == expected
 
+    def test_parse_beat_schedule_all_entries_have_trigger_source_header(self) -> None:
+        """Every beat entry must carry trigger_source=scheduled so the task signal
+        handler can identify scheduler-originated tasks."""
+        schedule = parse_beat_schedule()
+        for name, entry in schedule.items():
+            headers = entry.get("options", {}).get("headers", {})
+            assert headers.get("trigger_source") == "scheduled", (
+                f"Beat entry '{name}' is missing trigger_source header"
+            )
+
 
 class TestParseDbSettings:
     """Test suite for parse_db_settings function."""
@@ -296,8 +330,19 @@ class TestParseDbSettings:
                 {
                     "default": {
                         "ENGINE": "django.db.backends.sqlite3",
-                        "NAME": None,  # Will be replaced with tmp_path
-                        "OPTIONS": {},
+                        "NAME": None,  # replaced with tmp_path in test body
+                        "OPTIONS": {
+                            "init_command": (
+                                "PRAGMA journal_mode=WAL;"
+                                "PRAGMA synchronous=NORMAL;"
+                                "PRAGMA busy_timeout=5000;"
+                                "PRAGMA temp_store=MEMORY;"
+                                "PRAGMA mmap_size=134217728;"
+                                "PRAGMA journal_size_limit=67108864;"
+                                "PRAGMA cache_size=-8000"
+                            ),
+                            "transaction_mode": "IMMEDIATE",
+                        },
                     },
                 },
                 id="default-sqlite",
@@ -310,13 +355,40 @@ class TestParseDbSettings:
                 {
                     "default": {
                         "ENGINE": "django.db.backends.sqlite3",
-                        "NAME": None,  # Will be replaced with tmp_path
+                        "NAME": None,
                         "OPTIONS": {
+                            "init_command": (
+                                "PRAGMA journal_mode=WAL;"
+                                "PRAGMA synchronous=NORMAL;"
+                                "PRAGMA busy_timeout=5000;"
+                                "PRAGMA temp_store=MEMORY;"
+                                "PRAGMA mmap_size=134217728;"
+                                "PRAGMA journal_size_limit=67108864;"
+                                "PRAGMA cache_size=-8000"
+                            ),
+                            "transaction_mode": "IMMEDIATE",
                             "timeout": 30,
                         },
                     },
                 },
                 id="sqlite-with-timeout-override",
+            ),
+            pytest.param(
+                {
+                    "PAPERLESS_DBENGINE": "sqlite",
+                    "PAPERLESS_DB_OPTIONS": "init_command=PRAGMA journal_mode=DELETE;PRAGMA synchronous=FULL,transaction_mode=DEFERRED",
+                },
+                {
+                    "default": {
+                        "ENGINE": "django.db.backends.sqlite3",
+                        "NAME": None,
+                        "OPTIONS": {
+                            "init_command": "PRAGMA journal_mode=DELETE;PRAGMA synchronous=FULL",
+                            "transaction_mode": "DEFERRED",
+                        },
+                    },
+                },
+                id="sqlite-options-override",
             ),
             pytest.param(
                 {
@@ -335,6 +407,7 @@ class TestParseDbSettings:
                             "sslrootcert": None,
                             "sslcert": None,
                             "sslkey": None,
+                            "application_name": "paperless-ngx",
                         },
                     },
                 },
@@ -348,7 +421,7 @@ class TestParseDbSettings:
                     "PAPERLESS_DBNAME": "customdb",
                     "PAPERLESS_DBUSER": "customuser",
                     "PAPERLESS_DBPASS": "custompass",
-                    "PAPERLESS_DB_OPTIONS": "pool.max_size=50;pool.min_size=2;sslmode=require",
+                    "PAPERLESS_DB_OPTIONS": "pool.max_size=50,pool.min_size=2,sslmode=require",
                 },
                 {
                     "default": {
@@ -363,6 +436,7 @@ class TestParseDbSettings:
                             "sslrootcert": None,
                             "sslcert": None,
                             "sslkey": None,
+                            "application_name": "paperless-ngx",
                             "pool": {
                                 "min_size": 2,
                                 "max_size": 50,
@@ -390,6 +464,7 @@ class TestParseDbSettings:
                             "sslrootcert": None,
                             "sslcert": None,
                             "sslkey": None,
+                            "application_name": "paperless-ngx",
                             "pool": {
                                 "min_size": 1,
                                 "max_size": 10,
@@ -419,6 +494,7 @@ class TestParseDbSettings:
                             "sslrootcert": "/certs/ca.crt",
                             "sslcert": None,
                             "sslkey": None,
+                            "application_name": "paperless-ngx",
                             "connect_timeout": 30,
                         },
                     },
@@ -447,6 +523,7 @@ class TestParseDbSettings:
                                 "cert": None,
                                 "key": None,
                             },
+                            "isolation_level": "read committed",
                         },
                     },
                 },
@@ -455,18 +532,17 @@ class TestParseDbSettings:
             pytest.param(
                 {
                     "PAPERLESS_DBENGINE": "mariadb",
-                    "PAPERLESS_DBHOST": "paperless-mariadb-host",
-                    "PAPERLESS_DBPORT": "5555",
+                    "PAPERLESS_DBHOST": "mariahost",
+                    "PAPERLESS_DBNAME": "paperlessdb",
                     "PAPERLESS_DBUSER": "my-cool-user",
                     "PAPERLESS_DBPASS": "my-secure-password",
-                    "PAPERLESS_DB_OPTIONS": "ssl.ca=/path/to/ca.pem;ssl_mode=REQUIRED",
+                    "PAPERLESS_DB_OPTIONS": "ssl_mode=REQUIRED,ssl.ca=/path/to/ca.pem",
                 },
                 {
                     "default": {
                         "ENGINE": "django.db.backends.mysql",
-                        "HOST": "paperless-mariadb-host",
-                        "PORT": 5555,
-                        "NAME": "paperless",
+                        "HOST": "mariahost",
+                        "NAME": "paperlessdb",
                         "USER": "my-cool-user",
                         "PASSWORD": "my-secure-password",
                         "OPTIONS": {
@@ -479,6 +555,7 @@ class TestParseDbSettings:
                                 "cert": None,
                                 "key": None,
                             },
+                            "isolation_level": "read committed",
                         },
                     },
                 },
@@ -512,6 +589,7 @@ class TestParseDbSettings:
                                 "key": "/certs/client.key",
                             },
                             "connect_timeout": 25,
+                            "isolation_level": "read committed",
                         },
                     },
                 },
@@ -527,10 +605,8 @@ class TestParseDbSettings:
         expected_database_settings: dict[str, dict],
     ) -> None:
         """Test various database configurations with defaults and overrides."""
-        # Clear environment and set test vars
         mocker.patch.dict(os.environ, env_vars, clear=True)
 
-        # Update expected paths with actual tmp_path
         if (
             "default" in expected_database_settings
             and expected_database_settings["default"]["NAME"] is None

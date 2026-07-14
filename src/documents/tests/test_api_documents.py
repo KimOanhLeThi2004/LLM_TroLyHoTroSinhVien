@@ -47,11 +47,12 @@ from documents.models import Workflow
 from documents.models import WorkflowAction
 from documents.models import WorkflowTrigger
 from documents.signals.handlers import run_workflows
+from documents.tests.utils import ConsumeTaskMixin
 from documents.tests.utils import DirectoriesMixin
-from documents.tests.utils import DocumentConsumeDelayMixin
+from documents.tests.utils import read_streaming_response
 
 
-class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
+class TestDocumentApi(DirectoriesMixin, ConsumeTaskMixin, APITestCase):
     def setUp(self) -> None:
         super().setUp()
 
@@ -323,19 +324,16 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
             f.write(content_thumbnail)
 
         response = self.client.get(f"/api/documents/{doc.pk}/download/")
-
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.content, content)
+        self.assertEqual(read_streaming_response(response), content)
 
         response = self.client.get(f"/api/documents/{doc.pk}/preview/")
-
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.content, content)
+        self.assertEqual(read_streaming_response(response), content)
 
         response = self.client.get(f"/api/documents/{doc.pk}/thumb/")
-
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.content, content_thumbnail)
+        self.assertEqual(read_streaming_response(response), content_thumbnail)
 
     def test_document_actions_with_perms(self) -> None:
         """
@@ -386,12 +384,15 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
 
         response = self.client.get(f"/api/documents/{doc.pk}/download/")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+        response.close()
 
         response = self.client.get(f"/api/documents/{doc.pk}/preview/")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+        response.close()
 
         response = self.client.get(f"/api/documents/{doc.pk}/thumb/")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+        response.close()
 
     @override_settings(FILENAME_FORMAT="")
     def test_download_with_archive(self) -> None:
@@ -412,28 +413,24 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
             f.write(content_archive)
 
         response = self.client.get(f"/api/documents/{doc.pk}/download/")
-
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.content, content_archive)
+        self.assertEqual(read_streaming_response(response), content_archive)
 
         response = self.client.get(
             f"/api/documents/{doc.pk}/download/?original=true",
         )
-
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.content, content)
+        self.assertEqual(read_streaming_response(response), content)
 
         response = self.client.get(f"/api/documents/{doc.pk}/preview/")
-
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.content, content_archive)
+        self.assertEqual(read_streaming_response(response), content_archive)
 
         response = self.client.get(
             f"/api/documents/{doc.pk}/preview/?original=true",
         )
-
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.content, content)
+        self.assertEqual(read_streaming_response(response), content)
 
     @override_settings(FILENAME_FORMAT="")
     def test_download_follow_formatting(self) -> None:
@@ -456,18 +453,21 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
         # Without follow_formatting, should use public filename
         response = self.client.get(f"/api/documents/{doc.pk}/download/")
         self.assertIn("none.pdf", response["Content-Disposition"])
+        response.close()
 
         # With follow_formatting, should use actual filename on disk
         response = self.client.get(
             f"/api/documents/{doc.pk}/download/?follow_formatting=true",
         )
         self.assertIn("archived.pdf", response["Content-Disposition"])
+        response.close()
 
         # With follow_formatting and original, should use source filename
         response = self.client.get(
             f"/api/documents/{doc.pk}/download/?original=true&follow_formatting=true",
         )
         self.assertIn("my_document.pdf", response["Content-Disposition"])
+        response.close()
 
     def test_document_actions_not_existing_file(self) -> None:
         doc = Document.objects.create(
@@ -484,6 +484,42 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
 
         response = self.client.get(f"/api/documents/{doc.pk}/thumb/")
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_document_actions_trashed_document(self) -> None:
+        """
+        GIVEN:
+            - Document with files exists
+        WHEN:
+            - Document is soft-deleted (moved to trash)
+            - Preview and thumb endpoints are requested
+        THEN:
+            - HTTP 200 OK for both (trashed documents remain previewable)
+        """
+        _, filename = tempfile.mkstemp(dir=self.dirs.originals_dir)
+        content = b"This is a test"
+        content_thumbnail = b"thumbnail content"
+
+        with Path(filename).open("wb") as f:
+            f.write(content)
+
+        doc = Document.objects.create(
+            title="none",
+            filename=Path(filename).name,
+            mime_type="application/pdf",
+        )
+
+        with (self.dirs.thumbnail_dir / f"{doc.pk:07d}.webp").open("wb") as f:
+            f.write(content_thumbnail)
+
+        doc.delete()
+
+        response = self.client.get(f"/api/documents/{doc.pk}/preview/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(read_streaming_response(response), content)
+
+        response = self.client.get(f"/api/documents/{doc.pk}/thumb/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(read_streaming_response(response), content_thumbnail)
 
     def test_document_history_action(self) -> None:
         """
@@ -1168,7 +1204,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
         self.assertIn("all", response.data)
         self.assertCountEqual(response.data["all"], [d.id for d in docs])
 
-    def test_default_ordering_uses_id_as_tiebreaker(self):
+    def test_default_ordering_uses_id_as_tiebreaker(self) -> None:
         """
         GIVEN:
             - Documents sharing the same created date
@@ -1305,6 +1341,35 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
         self.assertEqual(response.data["document_type_count"], 1)
         self.assertEqual(response.data["storage_path_count"], 2)
 
+    def test_statistics_excludes_document_versions(self) -> None:
+        root = Document.objects.create(
+            title="root",
+            checksum="A",
+            mime_type="application/pdf",
+            content="root",
+        )
+        version = Document.objects.create(
+            title="version",
+            checksum="B",
+            mime_type="application/pdf",
+            content="version",
+            root_document=root,
+            version_index=1,
+        )
+        tag_inbox = Tag.objects.create(name="t1", is_inbox_tag=True)
+        version.tags.add(tag_inbox)
+
+        response = self.client.get("/api/statistics/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["documents_total"], 1)
+        self.assertEqual(response.data["documents_inbox"], 0)
+        self.assertEqual(response.data["character_count"], 4)
+        self.assertEqual(
+            response.data["document_file_type_counts"][0]["mime_type_count"],
+            1,
+        )
+
     def test_statistics_no_inbox_tag(self) -> None:
         Document.objects.create(title="none1", checksum="A")
 
@@ -1400,9 +1465,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        input_doc, overrides = self.get_last_consume_delay_call_args()
+        input_doc, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(input_doc.original_file.name, "simple.pdf")
         self.assertTrue(
@@ -1432,9 +1495,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
         )
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.consume_file_mock.assert_called_once()
-
-        input_doc, overrides = self.get_last_consume_delay_call_args()
+        input_doc, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(input_doc.original_file.name, "outside.pdf")
         self.assertEqual(overrides.filename, "outside.pdf")
@@ -1474,9 +1535,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
         )
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.consume_file_mock.assert_called_once()
-
-        input_doc, overrides = self.get_last_consume_delay_call_args()
+        input_doc, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(input_doc.original_file.name, "outside.pdf")
         self.assertEqual(overrides.filename, "outside.pdf")
@@ -1558,9 +1617,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        input_doc, overrides = self.get_last_consume_delay_call_args()
+        input_doc, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(input_doc.original_file.name, "simple.pdf")
         self.assertTrue(
@@ -1612,9 +1669,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
             )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        _, overrides = self.get_last_consume_delay_call_args()
+        _, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(overrides.title, "my custom title")
         self.assertIsNone(overrides.correspondent_id)
@@ -1634,9 +1689,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
             )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        _, overrides = self.get_last_consume_delay_call_args()
+        _, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(overrides.correspondent_id, c.id)
         self.assertIsNone(overrides.title)
@@ -1670,9 +1723,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
             )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        _, overrides = self.get_last_consume_delay_call_args()
+        _, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(overrides.document_type_id, dt.id)
         self.assertIsNone(overrides.correspondent_id)
@@ -1706,9 +1757,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
             )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        _, overrides = self.get_last_consume_delay_call_args()
+        _, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(overrides.storage_path_id, sp.id)
         self.assertIsNone(overrides.correspondent_id)
@@ -1743,9 +1792,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
             )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        _, overrides = self.get_last_consume_delay_call_args()
+        _, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertCountEqual(overrides.tag_ids, [t1.id, t2.id])
         self.assertIsNone(overrides.document_type_id)
@@ -1790,9 +1837,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
             )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        _, overrides = self.get_last_consume_delay_call_args()
+        _, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(overrides.created, created.date())
 
@@ -1809,9 +1854,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        input_doc, overrides = self.get_last_consume_delay_call_args()
+        input_doc, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(input_doc.original_file.name, "simple.pdf")
         self.assertEqual(overrides.filename, "simple.pdf")
@@ -1841,9 +1884,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        input_doc, overrides = self.get_last_consume_delay_call_args()
+        input_doc, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(input_doc.original_file.name, "simple.pdf")
         self.assertEqual(overrides.filename, "simple.pdf")
@@ -1898,9 +1939,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        input_doc, overrides = self.get_last_consume_delay_call_args()
+        input_doc, overrides = self.assert_queue_consumption_task_call_args()
 
         new_overrides, _ = run_workflows(
             trigger_type=WorkflowTrigger.WorkflowTriggerType.CONSUMPTION,
@@ -1946,9 +1985,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        input_doc, overrides = self.get_last_consume_delay_call_args()
+        input_doc, overrides = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(input_doc.original_file.name, "simple.pdf")
         self.assertEqual(overrides.filename, "simple.pdf")
@@ -2047,9 +2084,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        self.consume_file_mock.assert_called_once()
-
-        input_doc, _ = self.get_last_consume_delay_call_args()
+        input_doc, _ = self.assert_queue_consumption_task_call_args()
 
         self.assertEqual(input_doc.source, WorkflowTrigger.DocumentSourceChoices.WEB_UI)
 
@@ -2175,6 +2210,29 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
         response = self.client.get("/api/documents/34676/suggestions/")
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
+    @mock.patch("documents.views.get_ai_document_classification")
+    @override_settings(AI_ENABLED=True)
+    def test_suggestions_still_uses_classifier_when_ai_enabled(
+        self,
+        mock_get_ai_classification,
+    ) -> None:
+        doc = Document.objects.create(title="test", mime_type="application/pdf")
+
+        response = self.client.get(f"/api/documents/{doc.pk}/suggestions/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data,
+            {
+                "correspondents": [],
+                "tags": [],
+                "document_types": [],
+                "storage_paths": [],
+                "dates": [],
+            },
+        )
+        mock_get_ai_classification.assert_not_called()
+
     @mock.patch("documents.views.match_storage_paths")
     @mock.patch("documents.views.match_document_types")
     @mock.patch("documents.views.match_tags")
@@ -2186,7 +2244,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
         match_tags,
         match_document_types,
         match_storage_paths,
-    ):
+    ) -> None:
         doc = Document.objects.create(
             title="test",
             mime_type="application/pdf",
@@ -2223,7 +2281,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
         match_document_types,
         match_storage_paths,
         mocked_load,
-    ):
+    ) -> None:
         """
         GIVEN:
            - Request for suggestions for a document
@@ -2306,7 +2364,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
     def test_get_suggestions_dates_disabled(
         self,
         mock_get_date_parser: mock.MagicMock,
-    ):
+    ) -> None:
         """
         GIVEN:
             - NUMBER_OF_SUGGESTED_DATES = 0 (disables feature)
@@ -3054,6 +3112,46 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
         # modified was updated to today
         self.assertEqual(doc.modified.day, timezone.now().day)
 
+    def test_create_note_only_saves_document_modified_field(self) -> None:
+        """
+        GIVEN:
+            - Existing document with a created date
+        WHEN:
+            - API request is made to add a note
+        THEN:
+            - Only the document modified field is persisted by the note endpoint
+            - Other document fields are not rewritten by the note endpoint
+        """
+        doc = Document.objects.create(
+            title="test",
+            mime_type="application/pdf",
+            content="this is a document which will have notes added",
+            created=datetime.date(2026, 3, 31),
+        )
+        original_save = Document.save
+
+        with mock.patch.object(
+            Document,
+            "save",
+            autospec=True,
+            side_effect=original_save,
+        ) as save_mock:
+            resp = self.client.post(
+                f"/api/documents/{doc.pk}/notes/",
+                data={"note": "this is a posted note"},
+            )
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        doc.refresh_from_db()
+        self.assertEqual(doc.created, datetime.date(2026, 3, 31))
+        self.assertTrue(
+            any(
+                call.kwargs.get("update_fields") == ["modified"]
+                for call in save_mock.call_args_list
+                if call.args and call.args[0].pk == doc.pk
+            ),
+        )
+
     def test_notes_permissions_aware(self) -> None:
         """
         GIVEN:
@@ -3145,6 +3243,77 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
         doc = Document.objects.get(pk=doc.pk)
         # modified was updated to today
         self.assertEqual(doc.modified.day, timezone.now().day)
+
+    def test_delete_note_missing_id(self) -> None:
+        """
+        GIVEN:
+            - Existing document
+        WHEN:
+            - API DELETE request to notes endpoint without an id query param
+            - API DELETE request to notes endpoint with an empty id query param
+        THEN:
+            - HTTP 400 is returned
+        """
+        doc = Document.objects.create(
+            title="test",
+            mime_type="application/pdf",
+            content="this is a document",
+        )
+
+        response = self.client.delete(
+            f"/api/documents/{doc.pk}/notes/",
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        response = self.client.delete(
+            f"/api/documents/{doc.pk}/notes/?id=",
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_delete_note_invalid_id(self) -> None:
+        """
+        GIVEN:
+            - Existing document
+        WHEN:
+            - API DELETE request to notes endpoint with a non-integer note id
+        THEN:
+            - HTTP 400 is returned
+        """
+        doc = Document.objects.create(
+            title="test",
+            mime_type="application/pdf",
+            content="this is a document",
+        )
+
+        response = self.client.delete(
+            f"/api/documents/{doc.pk}/notes/?id=notaninteger",
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_delete_note_nonexistent_id(self) -> None:
+        """
+        GIVEN:
+            - Existing document, no notes
+        WHEN:
+            - API DELETE request to notes endpoint with a non-existent note id
+        THEN:
+            - HTTP 404 is returned
+        """
+        doc = Document.objects.create(
+            title="test",
+            mime_type="application/pdf",
+            content="this is a document",
+        )
+
+        response = self.client.delete(
+            f"/api/documents/{doc.pk}/notes/?id=99999",
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
     def test_get_notes_no_doc(self) -> None:
         """
@@ -3368,7 +3537,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
 
-    def test_create_share_link_requires_view_permission_for_document(self):
+    def test_create_share_link_requires_view_permission_for_document(self) -> None:
         """
         GIVEN:
             - A user with add_sharelink but without view permission on a document
@@ -3416,7 +3585,7 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
         self.assertEqual(create_resp.status_code, status.HTTP_201_CREATED)
         self.assertEqual(create_resp.data["document"], doc.pk)
 
-    def test_next_asn(self):
+    def test_next_asn(self) -> None:
         """
         GIVEN:
             - Existing documents with ASNs, highest owned by user2

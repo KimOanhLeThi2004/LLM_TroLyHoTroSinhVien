@@ -1,6 +1,5 @@
-import grp
+import logging
 import os
-import pwd
 import shutil
 import stat
 import subprocess
@@ -38,8 +37,8 @@ def path_check(var: str, directory: Path) -> list[Error]:
             except PermissionError:
                 dir_stat: os.stat_result = Path(directory).stat()
                 dir_mode: str = stat.filemode(dir_stat.st_mode)
-                dir_owner: str = pwd.getpwuid(dir_stat.st_uid).pw_name
-                dir_group: str = grp.getgrgid(dir_stat.st_gid).gr_name
+                dir_owner: str = ""
+                dir_group: str = ""
                 messages.append(
                     Error(
                         writeable_message.format(var),
@@ -204,10 +203,10 @@ def check_v3_minimum_upgrade_version(
     **kwargs: object,
 ) -> list[Error]:
     """
-    Enforce that upgrades to v3 must start from v2.20.10.
+    Enforce that upgrades to v3 must start from v2.20.15.
 
     v3 squashes all prior migrations into 0001_squashed and 0002_squashed.
-    If a user skips v2.20.10, the data migration in 1075_workflowaction_order
+    If a user skips v2.20.15, the data migration in 1075_workflowaction_order
     never runs and the squash may apply schema changes against an incomplete
     database state.
     """
@@ -234,19 +233,28 @@ def check_v3_minimum_upgrade_version(
         if {"0001_squashed", "0002_squashed"} & applied:
             return []
 
-        # On v2.20.10 exactly — squash will pick up cleanly from here
+        # On v2.20.15 exactly — squash will pick up cleanly from here
         if "1075_workflowaction_order" in applied:
             return []
 
     except (DatabaseError, OperationalError):
         return []
 
+    logger = logging.getLogger(__name__)
+    last_applied = sorted(applied)[-1] if applied else "(none)"
+    logger.error(
+        "V3 upgrade check failed: last applied documents migration is %r. "
+        "Expected '1075_workflowaction_order' (v2.20.15). "
+        "Ensure you have upgraded to v2.20.15 and run 'manage.py migrate' before upgrading to v3.",
+        last_applied,
+    )
+
     return [
         Error(
             "Cannot upgrade to Paperless-ngx v3 from this version.",
             hint=(
-                "Upgrading to v3 can only be performed from v2.20.10."
-                "Please upgrade to v2.20.10, run migrations, then upgrade to v3."
+                "Upgrading to v3 can only be performed from v2.20.15. "
+                "Please upgrade to v2.20.15, run migrations, then upgrade to v3. "
                 "See https://docs.paperless-ngx.com/setup/#upgrading for details."
             ),
             id="paperless.E002",

@@ -144,18 +144,29 @@ class StoragePathAdmin(GuardedModelAdmin):
 
 
 class TaskAdmin(admin.ModelAdmin):
-    list_display = ("task_id", "task_file_name", "task_name", "date_done", "status")
-    list_filter = ("status", "date_done", "task_name")
-    search_fields = ("task_name", "task_id", "status", "task_file_name")
+    list_display = (
+        "task_id",
+        "task_type",
+        "trigger_source",
+        "status",
+        "date_created",
+        "date_done",
+        "duration_seconds",
+    )
+    list_filter = ("status", "task_type", "trigger_source", "date_done")
+    search_fields = ("task_id", "task_type", "status")
     readonly_fields = (
         "task_id",
-        "task_file_name",
-        "task_name",
+        "task_type",
+        "trigger_source",
         "status",
         "date_created",
         "date_started",
         "date_done",
-        "result",
+        "duration_seconds",
+        "wait_time_seconds",
+        "input_data",
+        "result_data",
     )
 
 
@@ -187,6 +198,7 @@ class ShareLinksAdmin(GuardedModelAdmin):
 class ShareLinkBundleAdmin(GuardedModelAdmin):
     list_display = ("created", "status", "expiration", "owner", "slug")
     list_filter = ("status", "created", "expiration", "owner")
+    readonly_fields = ("file_path",)
     search_fields = ("slug",)
 
     def get_queryset(self, request):  # pragma: no cover

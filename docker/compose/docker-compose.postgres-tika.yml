@@ -44,10 +44,12 @@ services:
       POSTGRES_USER: paperless
       POSTGRES_PASSWORD: paperless
   webserver:
-    image: ghcr.io/paperless-ngx/paperless-ngx:latest
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: paperless-ngx-local:dev
     restart: unless-stopped
     depends_on:
-      - db
       - broker
       - gotenberg
       - tika
@@ -61,13 +63,11 @@ services:
     env_file: docker-compose.env
     environment:
       PAPERLESS_REDIS: redis://broker:6379
-      PAPERLESS_DBHOST: db
-      PAPERLESS_DBENGINE: postgresql
       PAPERLESS_TIKA_ENABLED: 1
       PAPERLESS_TIKA_GOTENBERG_ENDPOINT: http://gotenberg:3000
       PAPERLESS_TIKA_ENDPOINT: http://tika:9998
   gotenberg:
-    image: docker.io/gotenberg/gotenberg:8.27
+    image: docker.io/gotenberg/gotenberg:8.33
     restart: unless-stopped
     # The gotenberg chromium route is used to convert .eml files. We do not
     # want to allow external content like tracking pixels or even javascript.

@@ -1,6 +1,6 @@
+from documents.search._backend import SearchHit
 from documents.search._backend import SearchIndexLockError
 from documents.search._backend import SearchMode
-from documents.search._backend import SearchResults
 from documents.search._backend import TantivyBackend
 from documents.search._backend import TantivyRelevanceList
 from documents.search._backend import WriteBatch
@@ -20,9 +20,9 @@ __all__ = [
     "PreprocessedQuery",
     "HybridFullTextMatch",
     "HybridFullTextResult",
+    "SearchHit",
     "SearchIndexLockError",
     "SearchMode",
-    "SearchResults",
     "TantivyBackend",
     "TantivyRelevanceList",
     "WriteBatch",

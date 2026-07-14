@@ -38,6 +38,7 @@ from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.viewsets import ModelViewSet
 
+from documents.models import PaperlessTask
 from documents.permissions import PaperlessObjectPermissions
 from documents.tasks import llmindex_index
 from paperless.filters import GroupFilterSet
@@ -90,7 +91,7 @@ class StandardPagination(PageNumberPagination):
 
         query = self.page.paginator.object_list
         if isinstance(query, TantivyRelevanceList):
-            return [h["id"] for h in query._hits]
+            return query.get_all_ids()
         return self.page.paginator.object_list.values_list("pk", flat=True)
 
     def get_paginated_response_schema(self, schema):
@@ -190,6 +191,16 @@ class UserViewSet(ModelViewSet[User]):
                 "Staff status can only be changed by a superuser",
             )
         return super().update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        user_to_delete: User = self.get_object()
+
+        if not request.user.is_superuser and user_to_delete.is_superuser:
+            return HttpResponseForbidden(
+                "Superusers can only be deleted by other superusers",
+            )
+
+        return super().destroy(request, *args, **kwargs)
 
     @extend_schema(
         request=None,
@@ -412,25 +423,57 @@ class ApplicationConfigurationViewSet(ModelViewSet[ApplicationConfiguration]):
 
     def perform_update(self, serializer):
         old_instance = ApplicationConfiguration.objects.all().first()
-        old_ai_index_enabled = (
-            old_instance.ai_enabled and old_instance.llm_embedding_backend
+        old_llm_embedding_backend = (
+            old_instance.llm_embedding_backend or settings.LLM_EMBEDDING_BACKEND
+        )
+        old_llm_embedding_chunk_size = (
+            old_instance.llm_embedding_chunk_size or settings.LLM_EMBEDDING_CHUNK_SIZE
+        )
+        old_llm_embedding_endpoint = (
+            old_instance.llm_embedding_endpoint or settings.LLM_EMBEDDING_ENDPOINT
+        )
+        old_llm_embedding_model = (
+            old_instance.llm_embedding_model or settings.LLM_EMBEDDING_MODEL
+        )
+        old_llm_context_size = (
+            old_instance.llm_context_size or settings.LLM_CONTEXT_SIZE
         )
 
         new_instance: ApplicationConfiguration = serializer.save()
-        new_ai_index_enabled = (
-            new_instance.ai_enabled and new_instance.llm_embedding_backend
+        new_llm_embedding_backend = (
+            new_instance.llm_embedding_backend or settings.LLM_EMBEDDING_BACKEND
+        )
+        new_ai_index_enabled = bool(
+            new_instance.ai_enabled and new_llm_embedding_backend,
+        )
+        new_llm_embedding_chunk_size = (
+            new_instance.llm_embedding_chunk_size or settings.LLM_EMBEDDING_CHUNK_SIZE
+        )
+        new_llm_embedding_endpoint = (
+            new_instance.llm_embedding_endpoint or settings.LLM_EMBEDDING_ENDPOINT
+        )
+        new_llm_embedding_model = (
+            new_instance.llm_embedding_model or settings.LLM_EMBEDDING_MODEL
+        )
+        new_llm_context_size = (
+            new_instance.llm_context_size or settings.LLM_CONTEXT_SIZE
         )
 
-        if (
-            not old_ai_index_enabled
-            and new_ai_index_enabled
-            and not vector_store_file_exists()
-        ):
-            # AI index was just enabled and vector store file does not exist
-            llmindex_index.delay(
-                rebuild=True,
-                scheduled=False,
-                auto=True,
+        embedding_config_changed = (
+            old_llm_embedding_backend != new_llm_embedding_backend
+            or old_llm_embedding_chunk_size != new_llm_embedding_chunk_size
+            or old_llm_embedding_endpoint != new_llm_embedding_endpoint
+            or old_llm_embedding_model != new_llm_embedding_model
+            or old_llm_context_size != new_llm_context_size
+        )
+        rebuild_needed = new_ai_index_enabled and (
+            not vector_store_file_exists() or embedding_config_changed
+        )
+
+        if rebuild_needed:
+            llmindex_index.apply_async(
+                kwargs={"rebuild": True},
+                headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
             )
 
 

@@ -706,97 +706,161 @@ class UiSettings(models.Model):
 
 
 class PaperlessTask(ModelWithOwner):
-    ALL_STATES = sorted(states.ALL_STATES)
-    TASK_STATE_CHOICES = sorted(zip(ALL_STATES, ALL_STATES))
+    """
+    Tracks background task execution for user visibility and debugging.
+
+    State transitions:
+        PENDING -> STARTED -> SUCCESS
+        PENDING -> STARTED -> FAILURE
+        PENDING -> REVOKED (if cancelled before starting)
+    """
+
+    class Status(models.TextChoices):
+        PENDING = "pending", _("Pending")
+        STARTED = "started", _("Started")
+        SUCCESS = "success", _("Success")
+        FAILURE = "failure", _("Failure")
+        REVOKED = "revoked", _("Revoked")
 
     class TaskType(models.TextChoices):
-        AUTO = ("auto_task", _("Auto Task"))
-        SCHEDULED_TASK = ("scheduled_task", _("Scheduled Task"))
-        MANUAL_TASK = ("manual_task", _("Manual Task"))
+        CONSUME_FILE = "consume_file", _("Consume File")
+        TRAIN_CLASSIFIER = "train_classifier", _("Train Classifier")
+        SANITY_CHECK = "sanity_check", _("Sanity Check")
+        INDEX_OPTIMIZE = "index_optimize", _("Index Optimize")
+        MAIL_FETCH = "mail_fetch", _("Mail Fetch")
+        LLM_INDEX = "llm_index", _("LLM Index")
+        EMPTY_TRASH = "empty_trash", _("Empty Trash")
+        CHECK_WORKFLOWS = "check_workflows", _("Check Workflows")
+        BULK_UPDATE = "bulk_update", _("Bulk Update")
+        REPROCESS_DOCUMENT = "reprocess_document", _("Reprocess Document")
+        BUILD_SHARE_LINK = "build_share_link", _("Build Share Link")
+        BULK_DELETE = "bulk_delete", _("Bulk Delete")
 
-    class TaskName(models.TextChoices):
-        CONSUME_FILE = ("consume_file", _("Consume File"))
-        TRAIN_CLASSIFIER = ("train_classifier", _("Train Classifier"))
-        CHECK_SANITY = ("check_sanity", _("Check Sanity"))
-        INDEX_OPTIMIZE = ("index_optimize", _("Index Optimize"))
-        LLMINDEX_UPDATE = ("llmindex_update", _("LLM Index Update"))
+    COMPLETE_STATUSES = (
+        Status.SUCCESS,
+        Status.FAILURE,
+        Status.REVOKED,
+    )
+
+    class TriggerSource(models.TextChoices):
+        SCHEDULED = "scheduled", _("Scheduled")
+        WEB_UI = "web_ui", _("Web UI")
+        API_UPLOAD = "api_upload", _("API Upload")
+        FOLDER_CONSUME = "folder_consume", _("Folder Consume")
+        EMAIL_CONSUME = "email_consume", _("Email Consume")
+        SYSTEM = "system", _("System")
+        MANUAL = "manual", _("Manual")
 
     task_id = models.CharField(
-        max_length=255,
+        max_length=72,
         unique=True,
         verbose_name=_("Task ID"),
-        help_text=_("Celery ID for the Task that was run"),
+        help_text=_("Celery task ID"),
+    )
+
+    task_type = models.CharField(
+        max_length=50,
+        choices=TaskType.choices,
+        verbose_name=_("Task Type"),
+        help_text=_("The kind of work being performed"),
+        db_index=True,
+    )
+
+    trigger_source = models.CharField(
+        max_length=50,
+        choices=TriggerSource.choices,
+        verbose_name=_("Trigger Source"),
+        help_text=_("What initiated this task"),
+        db_index=True,
+    )
+
+    status = models.CharField(
+        max_length=30,
+        choices=Status.choices,
+        default=Status.PENDING,
+        verbose_name=_("Status"),
+        db_index=True,
+    )
+
+    date_created = models.DateTimeField(
+        default=timezone.now,
+        verbose_name=_("Created"),
+        db_index=True,
+    )
+
+    date_started = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name=_("Started"),
+    )
+
+    date_done = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name=_("Completed"),
+        db_index=True,
+    )
+
+    duration_seconds = models.FloatField(
+        null=True,
+        blank=True,
+        verbose_name=_("Duration (seconds)"),
+        help_text=_("Elapsed time from start to completion"),
+    )
+
+    wait_time_seconds = models.FloatField(
+        null=True,
+        blank=True,
+        verbose_name=_("Wait Time (seconds)"),
+        help_text=_("Time from task creation to worker pickup"),
+    )
+
+    input_data = models.JSONField(
+        default=dict,
+        blank=True,
+        verbose_name=_("Input Data"),
+        help_text=_("Structured input parameters for the task"),
+    )
+
+    result_data = models.JSONField(
+        null=True,
+        blank=True,
+        verbose_name=_("Result Data"),
+        help_text=_("Structured result data from task execution"),
     )
 
     acknowledged = models.BooleanField(
         default=False,
         verbose_name=_("Acknowledged"),
-        help_text=_("If the task is acknowledged via the frontend or API"),
+        db_index=True,
     )
 
-    task_file_name = models.CharField(
-        null=True,
-        max_length=255,
-        verbose_name=_("Task Filename"),
-        help_text=_("Name of the file which the Task was run for"),
-    )
+    class Meta:
+        verbose_name = _("Task")
+        verbose_name_plural = _("Tasks")
+        ordering = ["-date_created"]
+        indexes = [
+            models.Index(fields=["status", "date_created"]),
+            models.Index(fields=["task_type", "status"]),
+            models.Index(fields=["owner", "acknowledged", "date_created"]),
+        ]
 
-    task_name = models.CharField(
-        null=True,
-        max_length=255,
-        choices=TaskName.choices,
-        verbose_name=_("Task Name"),
-        help_text=_("Name of the task that was run"),
-    )
+    def __str__(self) -> str:  # pragma: no cover
+        return f"{self.get_task_type_display()} [{self.task_id[:8]}]"
 
-    status = models.CharField(
-        max_length=30,
-        default=states.PENDING,
-        choices=TASK_STATE_CHOICES,
-        verbose_name=_("Task State"),
-        help_text=_("Current state of the task being run"),
-    )
+    @property
+    def is_complete(self) -> bool:  # pragma: no cover
+        return self.status in self.COMPLETE_STATUSES
 
-    date_created = models.DateTimeField(
-        null=True,
-        default=timezone.now,
-        verbose_name=_("Created DateTime"),
-        help_text=_("Datetime field when the task result was created in UTC"),
-    )
-
-    date_started = models.DateTimeField(
-        null=True,
-        default=None,
-        verbose_name=_("Started DateTime"),
-        help_text=_("Datetime field when the task was started in UTC"),
-    )
-
-    date_done = models.DateTimeField(
-        null=True,
-        default=None,
-        verbose_name=_("Completed DateTime"),
-        help_text=_("Datetime field when the task was completed in UTC"),
-    )
-
-    result = models.TextField(
-        null=True,
-        default=None,
-        verbose_name=_("Result Data"),
-        help_text=_(
-            "The data returned by the task",
-        ),
-    )
-
-    type = models.CharField(
-        max_length=30,
-        choices=TaskType.choices,
-        default=TaskType.AUTO,
-        verbose_name=_("Task Type"),
-        help_text=_("The type of task that was run"),
-    )
-
-    def __str__(self) -> str:
-        return f"Task {self.task_id}"
+    @property
+    def related_document_ids(self) -> list[int]:  # pragma: no cover
+        if not self.result_data:
+            return []
+        if doc_id := self.result_data.get("document_id"):
+            return [doc_id]
+        if dup_id := self.result_data.get("duplicate_of"):
+            return [dup_id]
+        return []
 
 
 class Note(SoftDeleteModel):
@@ -1858,3 +1922,34 @@ class WorkflowRun(SoftDeleteModel):
 
     def __str__(self) -> str:
         return f"WorkflowRun of {self.workflow} at {self.run_at} on {self.document}"
+
+
+class DocumentLayout(models.Model):
+    document = models.OneToOneField(
+        Document,
+        on_delete=models.CASCADE,
+        related_name="layout_info",
+    )
+    layout = models.JSONField(default=dict)
+    updated = models.DateTimeField(auto_now=True)
+
+
+class DocumentKeyword(models.Model):
+    document = models.OneToOneField(
+        Document,
+        on_delete=models.CASCADE,
+        related_name="keyword_info",
+    )
+    keywords = models.JSONField(default=list)
+    updated = models.DateTimeField(auto_now=True)
+
+
+class DocumentTopic(models.Model):
+    document = models.OneToOneField(
+        Document,
+        on_delete=models.CASCADE,
+        related_name="topic_info",
+    )
+    topic = models.CharField(max_length=255)
+    score = models.FloatField(default=0)
+    updated = models.DateTimeField(auto_now=True)

@@ -26,7 +26,7 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
         self.user = user
         self.client.force_authenticate(user=user)
 
-        patcher = mock.patch("documents.bulk_edit.bulk_update_documents.delay")
+        patcher = mock.patch("documents.bulk_edit.bulk_update_documents.apply_async")
         self.async_task = patcher.start()
         self.addCleanup(patcher.stop)
         self.c1 = Correspondent.objects.create(name="c1")
@@ -62,7 +62,7 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
         m.return_value = return_value
         m.__name__ = method_name
 
-    @mock.patch("documents.bulk_edit.bulk_update_documents.delay")
+    @mock.patch("documents.bulk_edit.bulk_update_documents.apply_async")
     def test_api_set_correspondent(self, bulk_update_task_mock) -> None:
         self.assertNotEqual(self.doc1.correspondent, self.c1)
         response = self.client.post(
@@ -79,9 +79,13 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.doc1.refresh_from_db()
         self.assertEqual(self.doc1.correspondent, self.c1)
-        bulk_update_task_mock.assert_called_once_with(document_ids=[self.doc1.pk])
+        bulk_update_task_mock.assert_called_once()
+        self.assertCountEqual(
+            bulk_update_task_mock.call_args.kwargs["kwargs"]["document_ids"],
+            [self.doc1.pk],
+        )
 
-    @mock.patch("documents.bulk_edit.bulk_update_documents.delay")
+    @mock.patch("documents.bulk_edit.bulk_update_documents.apply_async")
     def test_api_unset_correspondent(self, bulk_update_task_mock) -> None:
         self.doc1.correspondent = self.c1
         self.doc1.save()
@@ -103,7 +107,7 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
         self.doc1.refresh_from_db()
         self.assertIsNone(self.doc1.correspondent)
 
-    @mock.patch("documents.bulk_edit.bulk_update_documents.delay")
+    @mock.patch("documents.bulk_edit.bulk_update_documents.apply_async")
     def test_api_set_type(self, bulk_update_task_mock) -> None:
         self.assertNotEqual(self.doc1.document_type, self.dt1)
         response = self.client.post(
@@ -120,9 +124,13 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.doc1.refresh_from_db()
         self.assertEqual(self.doc1.document_type, self.dt1)
-        bulk_update_task_mock.assert_called_once_with(document_ids=[self.doc1.pk])
+        bulk_update_task_mock.assert_called_once()
+        self.assertCountEqual(
+            bulk_update_task_mock.call_args.kwargs["kwargs"]["document_ids"],
+            [self.doc1.pk],
+        )
 
-    @mock.patch("documents.bulk_edit.bulk_update_documents.delay")
+    @mock.patch("documents.bulk_edit.bulk_update_documents.apply_async")
     def test_api_unset_type(self, bulk_update_task_mock) -> None:
         self.doc1.document_type = self.dt1
         self.doc1.save()
@@ -141,9 +149,13 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.doc1.refresh_from_db()
         self.assertIsNone(self.doc1.document_type)
-        bulk_update_task_mock.assert_called_once_with(document_ids=[self.doc1.pk])
+        bulk_update_task_mock.assert_called_once()
+        self.assertCountEqual(
+            bulk_update_task_mock.call_args.kwargs["kwargs"]["document_ids"],
+            [self.doc1.pk],
+        )
 
-    @mock.patch("documents.bulk_edit.bulk_update_documents.delay")
+    @mock.patch("documents.bulk_edit.bulk_update_documents.apply_async")
     def test_api_add_tag(self, bulk_update_task_mock) -> None:
         self.assertFalse(self.doc1.tags.filter(pk=self.t1.pk).exists())
 
@@ -163,9 +175,13 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
 
         self.assertTrue(self.doc1.tags.filter(pk=self.t1.pk).exists())
 
-        bulk_update_task_mock.assert_called_once_with(document_ids=[self.doc1.pk])
+        bulk_update_task_mock.assert_called_once()
+        self.assertCountEqual(
+            bulk_update_task_mock.call_args.kwargs["kwargs"]["document_ids"],
+            [self.doc1.pk],
+        )
 
-    @mock.patch("documents.bulk_edit.bulk_update_documents.delay")
+    @mock.patch("documents.bulk_edit.bulk_update_documents.apply_async")
     def test_api_remove_tag(self, bulk_update_task_mock) -> None:
         self.doc1.tags.add(self.t1)
 
@@ -655,6 +671,81 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
         self.assertEqual(args[0], [self.doc2.id])
         self.assertEqual(kwargs["storage_path"], self.sp1.id)
 
+    @mock.patch("documents.search.get_backend")
+    @mock.patch("documents.serialisers.bulk_edit.set_storage_path")
+    def test_api_bulk_edit_with_all_true_resolves_documents_from_search_filters(
+        self,
+        m,
+        get_backend,
+    ) -> None:
+        self.setup_mock(m, "set_storage_path")
+
+        for filters in (
+            {"text": "new doc 2017-03-16"},
+            {"title_search": "apple"},
+        ):
+            with self.subTest(filters=filters):
+                get_backend.return_value.search_ids.return_value = [self.doc2.id]
+
+                response = self.client.post(
+                    "/api/documents/bulk_edit/",
+                    json.dumps(
+                        {
+                            "all": True,
+                            "filters": filters,
+                            "method": "set_storage_path",
+                            "parameters": {"storage_path": self.sp1.id},
+                        },
+                    ),
+                    content_type="application/json",
+                )
+
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+                get_backend.return_value.search_ids.assert_called_once()
+                args, kwargs = m.call_args
+                self.assertEqual(args[0], [self.doc2.id])
+                self.assertEqual(kwargs["storage_path"], self.sp1.id)
+
+                m.reset_mock()
+                get_backend.return_value.search_ids.reset_mock()
+
+        # more_like_id is a different path
+        get_backend.return_value.more_like_this_ids.return_value = [self.doc2.id]
+        response = self.client.post(
+            "/api/documents/bulk_edit/",
+            json.dumps(
+                {
+                    "all": True,
+                    "filters": {"more_like_id": self.doc1.id},
+                    "method": "set_storage_path",
+                    "parameters": {"storage_path": self.sp1.id},
+                },
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        get_backend.return_value.more_like_this_ids.assert_called_once()
+
+    def test_api_bulk_edit_with_all_true_rejects_multiple_filters(self) -> None:
+        response = self.client.post(
+            "/api/documents/bulk_edit/",
+            json.dumps(
+                {
+                    "all": True,
+                    "filters": {
+                        "text": "B",
+                        "query": "c1",
+                    },
+                    "method": "set_storage_path",
+                    "parameters": {"storage_path": self.sp1.id},
+                },
+            ),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(b"Specify only one of", response.content)
+
     def test_api_bulk_edit_with_all_true_rejects_unsupported_methods(self) -> None:
         response = self.client.post(
             "/api/documents/bulk_edit/",
@@ -902,7 +993,7 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
             ],
         )
 
-    def test_api_selection_data_requires_view_permission(self):
+    def test_api_selection_data_requires_view_permission(self) -> None:
         self.doc2.owner = self.user
         self.doc2.save()
 

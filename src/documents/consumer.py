@@ -64,6 +64,39 @@ from paperless_ai.document_classifier import classify_document_input
 LOGGING_NAME: Final[str] = "paperless.consumer"
 
 
+def classify_document_kind(file_path: Path, mime_type: str) -> str:
+    text_extensions = {
+        ".docx",
+        ".txt",
+        ".html",
+        ".xml",
+        ".rtf",
+        ".xls",
+        ".xlsx",
+        ".ods",
+        ".ppt",
+        ".pptx",
+    }
+    image_extensions = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
+    ext = file_path.suffix.lower()
+
+    if ext in text_extensions:
+        return "text-native"
+    if ext in image_extensions:
+        return "scan-image"
+
+    if mime_type == "application/pdf":
+        try:
+            text = extract_pdf_text(file_path)
+            if text and len(text.strip()) > 300:
+                return "text-native"
+            return "scan-image"
+        except Exception:
+            return "scan-image"
+
+    return "unknown"
+
+
 class WorkflowTriggerPlugin(
     NoCleanupPluginMixin,
     NoSetupPluginMixin,
@@ -89,6 +122,15 @@ class WorkflowTriggerPlugin(
 
 class ConsumerError(Exception):
     pass
+
+
+class ConsumeFileDuplicateError(ConsumerError):
+    """Raised when a file is rejected because it duplicates an existing document."""
+
+    def __init__(self, message: str, duplicate_id: int, *, in_trash: bool) -> None:
+        super().__init__(message)
+        self.duplicate_id = duplicate_id
+        self.in_trash = in_trash
 
 
 class ConsumerStatusShortMessage(StrEnum):
@@ -418,6 +460,11 @@ class ConsumerPlugin(
             mime_type = magic.from_file(self.working_copy, mime=True)
 
             self.log.debug(f"Detected mime type: {mime_type}")
+            doc_kind = classify_document_kind(
+                self.working_copy,
+                mime_type,
+            )
+            self.log.info("Document classified as: %s", doc_kind)
 
 
             if (
@@ -878,6 +925,12 @@ class ConsumerPlugin(
             original_filename=self.filename,
         )
 
+        kind_tag = Tag.objects.filter(
+            name=classify_document_kind(self.working_copy, mime_type),
+        ).first()
+        if kind_tag:
+            document.add_nested_tags([kind_tag])
+
         self.apply_overrides(document)
 
         document.save()
@@ -1030,9 +1083,12 @@ class ConsumerPreflightPlugin(
                     )
                     failure_msg += " Note: existing document is in the trash."
 
-                self._fail(
-                    status_msg,
-                    failure_msg,
+                self._send_progress(100, 100, ProgressStatusOptions.FAILED, status_msg)
+                self.log.error(failure_msg)
+                raise ConsumeFileDuplicateError(
+                    f"{self.filename}: {failure_msg}",
+                    duplicate.pk,
+                    in_trash=duplicates_in_trash.exists(),
                 )
 
     def pre_check_directories(self) -> None:

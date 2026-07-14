@@ -75,8 +75,9 @@ class ColorConvertChoices(models.TextChoices):
 
 
 class LLMEmbeddingBackend(models.TextChoices):
-    OPENAI = ("openai", _("OpenAI"))
+    OPENAI_LIKE = ("openai-like", _("OpenAI-compatible"))
     HUGGINGFACE = ("huggingface", _("Huggingface"))
+    OLLAMA = ("ollama", _("Ollama"))
 
 
 class LLMBackend(models.TextChoices):
@@ -84,7 +85,7 @@ class LLMBackend(models.TextChoices):
     Matches to --llm-backend
     """
 
-    OPENAI = ("openai", _("OpenAI"))
+    OPENAI_LIKE = ("openai-like", _("OpenAI-compatible"))
     OLLAMA = ("ollama", _("Ollama"))
 
 
@@ -310,6 +311,25 @@ class ApplicationConfiguration(AbstractSingletonModel):
         max_length=128,
     )
 
+    llm_embedding_endpoint = models.CharField(
+        verbose_name=_("Sets the LLM embedding endpoint, optional"),
+        blank=True,
+        null=True,
+        max_length=256,
+    )
+
+    llm_embedding_chunk_size = models.PositiveSmallIntegerField(
+        verbose_name=_("Sets the LLM embedding chunk size"),
+        null=True,
+        validators=[MinValueValidator(1)],
+    )
+
+    llm_context_size = models.PositiveIntegerField(
+        verbose_name=_("Sets the LLM context size"),
+        null=True,
+        validators=[MinValueValidator(1)],
+    )
+
     llm_backend = models.CharField(
         verbose_name=_("Sets the LLM backend"),
         blank=True,
@@ -339,11 +359,18 @@ class ApplicationConfiguration(AbstractSingletonModel):
         max_length=256,
     )
 
+    llm_output_language = models.CharField(
+        verbose_name=_("Sets the LLM output language"),
+        blank=True,
+        null=True,
+        max_length=32,
+    )
+
     class Meta:
         verbose_name = _("paperless application settings")
         permissions = [
             ("view_global_statistics", "Can view global object counts"),
-            ("view_system_status", "Can view system status information"),
+            ("view_system_monitoring", "Can view system status information"),
         ]
 
     def __str__(self) -> str:  # pragma: no cover
