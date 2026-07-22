@@ -88,7 +88,9 @@ def score_hybrid_fulltext_document(
     phrase_groups = [
         phrase
         for phrase in preprocessed_query.phrase_groups
-        if phrase and phrase != normalized_query
+        if phrase
+        and phrase != normalized_query
+        and len(phrase.split()) > 1
     ]
     for phrase_index, phrase in enumerate(reversed(phrase_groups), start=1):
         phrase_length_bonus = len(phrase.split()) * 5
@@ -109,14 +111,18 @@ def score_hybrid_fulltext_document(
                 ),
             )
 
+    matched_tokens_by_field: dict[str, set[str]] = {
+        field: set() for field in searchable_fields
+    }
     for token in preprocessed_query.tokens:
         for field, value in searchable_fields.items():
             if not _contains(value, token):
                 continue
+            matched_tokens_by_field[field].add(token)
             token_score = {
-                "document_code": 35.0,
-                "title": 25.0,
-                "content": 15.0,
+                "document_code": 12.0,
+                "title": 8.0,
+                "content": 4.0,
             }[field]
             matches.append(
                 HybridFullTextMatch(
@@ -126,6 +132,18 @@ def score_hybrid_fulltext_document(
                     score=token_score,
                 ),
             )
+
+    if len(preprocessed_query.tokens) > 1:
+        has_phrase_match = any(
+            match.match_type in {"exact_phrase", "phrase_group"}
+            for match in matches
+        )
+        has_complete_token_match = any(
+            len(tokens) == len(set(preprocessed_query.tokens))
+            for tokens in matched_tokens_by_field.values()
+        )
+        if not has_phrase_match and not has_complete_token_match:
+            return None
 
     if not matches:
         return None

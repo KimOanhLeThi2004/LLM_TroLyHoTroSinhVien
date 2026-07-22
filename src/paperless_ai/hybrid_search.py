@@ -13,6 +13,7 @@ from documents.permissions import get_objects_for_user_owner_aware
 from documents.search._hybrid_fulltext import score_hybrid_fulltext_document
 from documents.search._query_preprocessor import PreprocessedQuery
 from documents.search._query_preprocessor import preprocess_hybrid_query
+from documents.search._tokenizer import ascii_fold
 from paperless_ai.semantic_search import SemanticSearchHit
 from paperless_ai.semantic_search import semantic_search
 
@@ -22,10 +23,15 @@ if TYPE_CHECKING:
 
 
 DEFAULT_TOP_K = 10
-DEFAULT_CANDIDATE_MULTIPLIER = 5
 DEFAULT_FULLTEXT_WEIGHT = 0.65
 DEFAULT_SEMANTIC_WEIGHT = 0.35
 DEFAULT_CHANNEL_AGREEMENT_BONUS = 0.05
+SUMMARY_LENGTH = 260
+SAMPLE_CONTEXT_CHARS = 90
+MAX_CONTENT_SAMPLES = 3
+SEMANTIC_TERMS = {
+    "chế tạo": ("sản xuất", "gia công", "chế biến"),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +45,11 @@ class HybridSearchHit:
     fulltext_rank: int | None
     semantic_rank: int | None
     matched_channels: tuple[str, ...]
+    summary: str
+    content_samples: list[str]
+    content_match_count: int
+    highlights: list[dict[str, object]]
+    semantic_samples: list[str]
     explanation: dict[str, object]
 
 
@@ -74,6 +85,11 @@ class _HybridCandidate:
     fulltext_rank: int | None
     semantic_rank: int | None
     matched_channels: tuple[str, ...]
+    summary: str
+    content_samples: list[str]
+    content_match_count: int
+    highlights: list[dict[str, object]]
+    semantic_samples: list[str]
     explanation: dict[str, object]
 
 
@@ -81,11 +97,10 @@ def hybrid_search(
     query: str,
     *,
     user: AbstractBaseUser | None = None,
-    top_k: int = DEFAULT_TOP_K,
+    top_k: int | None = None,
     fulltext_weight: float = DEFAULT_FULLTEXT_WEIGHT,
     semantic_weight: float = DEFAULT_SEMANTIC_WEIGHT,
     channel_agreement_bonus: float = DEFAULT_CHANNEL_AGREEMENT_BONUS,
-    candidate_multiplier: int = DEFAULT_CANDIDATE_MULTIPLIER,
     min_score: float | None = None,
 ) -> HybridSearchResults:
     """
@@ -99,20 +114,29 @@ def hybrid_search(
     channels find the same document, then normalized so the top hit is 1.0.
     """
     prepared_query = preprocess_hybrid_query(query)
-    if top_k <= 0 or not prepared_query.normalized_query:
+    if top_k is not None and top_k <= 0:
+        return HybridSearchResults(query=prepared_query, hits=[], total=0)
+    if not prepared_query.normalized_query:
         return HybridSearchResults(query=prepared_query, hits=[], total=0)
 
-    candidate_limit = max(top_k * max(candidate_multiplier, 1), top_k)
     fulltext_candidates = _fulltext_candidates(
         query,
         user=user,
-        limit=candidate_limit,
+        limit=None,
     )
-    semantic_candidates = semantic_search(
-        query,
-        user=user,
-        top_k=candidate_limit,
-    ).hits
+    semantic_candidates = []
+    if fulltext_candidates:
+        semantic_candidates = semantic_search(
+            query,
+            user=user,
+            top_k=len(fulltext_candidates),
+            document_ids=list(fulltext_candidates),
+        ).hits
+        semantic_candidates = [
+            hit
+            for hit in semantic_candidates
+            if hit.document_id in fulltext_candidates
+        ]
 
     fused_candidates = _fuse_candidates(
         fulltext_candidates=fulltext_candidates,
@@ -130,6 +154,15 @@ def hybrid_search(
             if candidate.raw_score >= min_score
         ]
 
+    ranked_candidates = fused_candidates if top_k is None else fused_candidates[:top_k]
+    document_context = _document_context(
+        [candidate.document_id for candidate in ranked_candidates],
+        prepared_query,
+        semantic_by_document={
+            semantic.document_id: semantic for semantic in semantic_candidates
+        },
+    )
+
     hits = [
         HybridSearchHit(
             document_id=candidate.document_id,
@@ -141,9 +174,29 @@ def hybrid_search(
             fulltext_rank=candidate.fulltext_rank,
             semantic_rank=candidate.semantic_rank,
             matched_channels=candidate.matched_channels,
+            summary=document_context.get(candidate.document_id, {}).get(
+                "summary",
+                "",
+            ),
+            content_samples=document_context.get(candidate.document_id, {}).get(
+                "content_samples",
+                [],
+            ),
+            content_match_count=document_context.get(candidate.document_id, {}).get(
+                "content_match_count",
+                0,
+            ),
+            highlights=document_context.get(candidate.document_id, {}).get(
+                "highlights",
+                [],
+            ),
+            semantic_samples=document_context.get(candidate.document_id, {}).get(
+                "semantic_samples",
+                [],
+            ),
             explanation=candidate.explanation,
         )
-        for rank, candidate in enumerate(fused_candidates[:top_k], start=1)
+        for rank, candidate in enumerate(ranked_candidates, start=1)
     ]
 
     return HybridSearchResults(
@@ -157,7 +210,7 @@ def hybrid_search_queryset(
     query: str,
     *,
     user: AbstractBaseUser | None = None,
-    top_k: int = DEFAULT_TOP_K,
+    top_k: int | None = DEFAULT_TOP_K,
     min_score: float | None = None,
 ) -> QuerySet[Document]:
     """
@@ -188,7 +241,7 @@ def _fulltext_candidates(
     query: str,
     *,
     user: AbstractBaseUser | None,
-    limit: int,
+    limit: int | None,
 ) -> dict[int, _FullTextCandidate]:
     preprocessed_query = preprocess_hybrid_query(query)
     if not preprocessed_query.normalized_query:
@@ -211,7 +264,9 @@ def _fulltext_candidates(
     raw_results = sorted(
         scored_results,
         key=lambda result: (-result.score, result.document_id),
-    )[:limit]
+    )
+    if limit is not None:
+        raw_results = raw_results[:limit]
 
     max_score = max(
         (result.score for result in raw_results),
@@ -315,6 +370,11 @@ def _fuse_candidates(
                 fulltext_rank=fulltext.rank if fulltext else None,
                 semantic_rank=semantic.rank if semantic else None,
                 matched_channels=matched_channels,
+                summary="",
+                content_samples=[],
+                content_match_count=0,
+                highlights=[],
+                semantic_samples=[],
                 explanation={
                     "fulltext_weight": fulltext_weight,
                     "semantic_weight": semantic_weight,
@@ -362,6 +422,11 @@ def _normalize_hybrid_scores(
             fulltext_rank=candidate.fulltext_rank,
             semantic_rank=candidate.semantic_rank,
             matched_channels=candidate.matched_channels,
+            summary=candidate.summary,
+            content_samples=candidate.content_samples,
+            content_match_count=candidate.content_match_count,
+            highlights=candidate.highlights,
+            semantic_samples=candidate.semantic_samples,
             explanation=candidate.explanation,
         )
         for candidate in candidates
@@ -383,3 +448,166 @@ def _document_titles(document_ids: set[int]) -> dict[int, str]:
     return dict(
         Document.objects.filter(pk__in=document_ids).values_list("pk", "title"),
     )
+
+
+def _document_context(
+    document_ids: list[int],
+    query: PreprocessedQuery,
+    *,
+    semantic_by_document: dict[int, SemanticSearchHit],
+) -> dict[int, dict[str, object]]:
+    if not document_ids:
+        return {}
+
+    documents = Document.objects.filter(pk__in=document_ids).only("id", "content")
+    by_id = {document.pk: document for document in documents}
+
+    context: dict[int, dict[str, object]] = {}
+    for document_id in document_ids:
+        content = by_id.get(document_id).content if document_id in by_id else ""
+        samples, match_count, highlights = _content_samples(content or "", query)
+        semantic = semantic_by_document.get(document_id)
+        semantic_samples = semantic.samples if semantic else []
+        context[document_id] = {
+            "summary": _content_summary(content or "", samples),
+            "content_samples": samples,
+            "content_match_count": match_count,
+            "highlights": [
+                *highlights,
+                *(
+                    [
+                        {
+                            "type": "semantic",
+                            "term": query.normalized_query,
+                            "count": len(semantic_samples),
+                            "samples": semantic_samples,
+                        },
+                    ]
+                    if semantic_samples
+                    else []
+                ),
+            ],
+            "semantic_samples": semantic_samples,
+        }
+    return context
+
+
+def _content_summary(content: str, samples: list[str]) -> str:
+    compact_content = " ".join(content.split())
+    if not compact_content:
+        return ""
+    if samples:
+        return samples[0][:SUMMARY_LENGTH]
+    return compact_content[:SUMMARY_LENGTH]
+
+
+def _content_samples(
+    content: str,
+    query: PreprocessedQuery,
+) -> tuple[list[str], int, list[dict[str, object]]]:
+    compact_content = " ".join(content.split())
+    if not compact_content:
+        return [], 0, []
+
+    search_terms = [
+        query.normalized_query,
+        *reversed(query.phrase_groups[:-1]),
+    ]
+    for term in search_terms:
+        samples, match_count = _samples_for_term(compact_content, term)
+        if match_count:
+            return samples, match_count, [
+                {
+                    "type": "exact_phrase",
+                    "term": term,
+                    "count": match_count,
+                    "samples": samples,
+                },
+                *_semantic_term_highlights(compact_content, query),
+            ]
+
+    token_samples: list[str] = []
+    token_match_count = 0
+    seen_tokens: set[str] = set()
+    for token in query.tokens:
+        normalized_token = token.casefold().strip()
+        if not normalized_token or normalized_token in seen_tokens:
+            continue
+        seen_tokens.add(normalized_token)
+        samples, match_count = _samples_for_term(compact_content, token)
+        token_match_count += match_count
+        for sample in samples:
+            if len(token_samples) >= MAX_CONTENT_SAMPLES:
+                break
+            token_samples.append(sample)
+
+    token_highlights = []
+    for token in seen_tokens:
+        samples, match_count = _samples_for_term(compact_content, token)
+        if match_count:
+            token_highlights.append(
+                {
+                    "type": "token",
+                    "term": token,
+                    "count": match_count,
+                    "samples": samples,
+                },
+            )
+
+    return (
+        token_samples,
+        token_match_count,
+        [*token_highlights, *_semantic_term_highlights(compact_content, query)],
+    )
+
+
+def _semantic_term_highlights(
+    content: str,
+    query: PreprocessedQuery,
+) -> list[dict[str, object]]:
+    terms = SEMANTIC_TERMS.get(query.normalized_query, ())
+    highlights = []
+    for term in terms:
+        samples, match_count = _samples_for_term(content, term)
+        if not match_count:
+            continue
+        highlights.append(
+            {
+                "type": "semantic_term",
+                "term": term,
+                "source_query": query.normalized_query,
+                "count": match_count,
+                "samples": samples,
+            },
+        )
+    return highlights
+
+
+def _samples_for_term(content: str, term: str) -> tuple[list[str], int]:
+    normalized_term = term.casefold().strip()
+    folded_term = ascii_fold(normalized_term)
+    if not folded_term:
+        return [], 0
+
+    folded_content = ascii_fold(content).casefold()
+    samples: list[str] = []
+    match_count = 0
+    start = 0
+    while True:
+        index = folded_content.find(folded_term, start)
+        if index < 0:
+            break
+        match_count += 1
+        if len(samples) < MAX_CONTENT_SAMPLES:
+            samples.append(_sample_window(content, index, len(normalized_term)))
+        start = index + max(len(folded_term), 1)
+
+    return samples, match_count
+
+
+def _sample_window(content: str, index: int, length: int) -> str:
+    start = max(index - SAMPLE_CONTEXT_CHARS, 0)
+    end = min(index + length + SAMPLE_CONTEXT_CHARS, len(content))
+    prefix = "... " if start > 0 else ""
+    suffix = " ..." if end < len(content) else ""
+    return f"{prefix}{content[start:end]}{suffix}"

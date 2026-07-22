@@ -38,6 +38,7 @@ class SemanticSearchHit:
     matched_nodes: int
     title: str
     metadata: dict[str, Any]
+    samples: list[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +134,7 @@ def semantic_search(
                 matched_nodes=hit.matched_nodes,
                 title=hit.title,
                 metadata=hit.metadata,
+                samples=hit.samples,
             )
             for rank, hit in enumerate(hits, start=1)
         ],
@@ -180,6 +182,7 @@ class _AggregatedHit:
     matched_nodes: int
     title: str
     metadata: dict[str, Any]
+    samples: list[str]
 
 
 def _build_semantic_query_text(query: PreprocessedQuery) -> str:
@@ -198,11 +201,11 @@ def _candidate_node_ids(index, document_ids: list[int] | None) -> list[str] | No
     if not document_ids:
         return None
 
-    allowed_ids = {str(document_id) for document_id in document_ids}
+    allowed_ids = {int(document_id) for document_id in document_ids}
     return [
         node.node_id
         for node in index.docstore.docs.values()
-        if node.metadata.get("document_id") in allowed_ids
+        if _safe_int(node.metadata.get("document_id")) in allowed_ids
     ]
 
 
@@ -221,6 +224,7 @@ def _aggregate_node_results(
 
         existing = by_document.get(document_id)
         title = str(metadata.get("title") or "")
+        sample = _node_sample(node_result)
         if existing is None:
             by_document[document_id] = _AggregatedHit(
                 document_id=document_id,
@@ -228,8 +232,13 @@ def _aggregate_node_results(
                 matched_nodes=1,
                 title=title,
                 metadata=metadata,
+                samples=[sample] if sample else [],
             )
             continue
+
+        samples = existing.samples
+        if sample and sample not in samples:
+            samples = [*samples, sample]
 
         by_document[document_id] = _AggregatedHit(
             document_id=document_id,
@@ -238,6 +247,7 @@ def _aggregate_node_results(
             matched_nodes=existing.matched_nodes + 1,
             title=existing.title or title,
             metadata=existing.metadata,
+            samples=samples[:3],
         )
 
     return sorted(
@@ -266,6 +276,7 @@ def _normalize_document_scores(hits: list[_AggregatedHit]) -> list[_AggregatedHi
             matched_nodes=hit.matched_nodes,
             title=hit.title,
             metadata=hit.metadata,
+            samples=hit.samples,
         )
         for hit in hits
     ]
@@ -306,6 +317,17 @@ def _safe_int(value: Any) -> int | None:
     except (TypeError, ValueError):
         logger.debug("Skipping semantic result with invalid document_id=%r", value)
         return None
+
+
+def _node_sample(node_result: NodeWithScore) -> str:
+    node = node_result.node
+    get_content = getattr(node, "get_content", None)
+    if callable(get_content):
+        try:
+            return " ".join(str(get_content()).split())[:500]
+        except TypeError:
+            pass
+    return " ".join(str(getattr(node, "text", "") or "").split())[:500]
 
 
 def _multi_node_boost(previous_match_count: int) -> float:
